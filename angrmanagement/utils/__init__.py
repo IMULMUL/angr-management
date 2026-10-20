@@ -1,10 +1,14 @@
-from typing import Optional
-import itertools
+from __future__ import annotations
 
-from .block_objects import FunctionHeader, Variables, PhiVariable, Label
+from typing import TYPE_CHECKING
+
+from .block_objects import FunctionHeader, Label, PhiVariable, Variables
+
+if TYPE_CHECKING:
+    from angr import Project
 
 
-def locate_function(inst, addr):
+def locate_function(inst, addr: int):
     """
     Locate the function that contains the address.
 
@@ -26,25 +30,40 @@ def locate_function(inst, addr):
     return None
 
 
-def get_label_text(addr, kb, function=None):
-
+def get_label_text(addr: int, kb, function=None):
     if addr in kb.labels:
         return kb.labels[addr] + ":"
 
     # default case
     if function is not None and addr == function.addr:
-        s = [ ]
+        s = []
         if function.name:
-            s.append("%s:" % function.name)
+            s.append(f"{function.name}:")
         else:
-            s.append("sub_%x:" % function.addr)
+            s.append(f"sub_{function.addr:x}:")
         if function.is_simprocedure:
-            s.append('[SimProcedure]')
+            s.append("[SimProcedure]")
         if function.is_plt:
-            s.append('[PLT]')
+            s.append("[PLT]")
         return "\n".join(s)
     else:
-        return "loc_%#x:" % addr
+        return f"loc_{addr:#x}:"
+
+
+def get_function_header(functions, func_addr: int) -> FunctionHeader | None:
+    try:
+        func = functions.get_by_addr(func_addr)
+    except KeyError:
+        func = None
+    if func is not None:
+        args = (
+            func.calling_convention.arg_locs(func.prototype)
+            if func.calling_convention is not None and func.prototype is not None
+            else None
+        )
+        func_header = FunctionHeader(func.name, func.demangled_name, func.prototype, args)
+        return func_header
+    return None
 
 
 def get_block_objects(disasm, nodes, func_addr):
@@ -59,26 +78,34 @@ def get_block_objects(disasm, nodes, func_addr):
     :rtype:                                     list
     """
 
+    nodes = list(nodes)
     block_addrs = [node.addr for node in nodes]
     block_addr = block_addrs[0]
-    insn_addrs = list(itertools.chain.from_iterable(disasm.block_to_insn_addrs[addr] for addr in block_addrs))
+    # collect the instruction addresses of each node, clipped to the node's own span: the Disassembly analysis is
+    # built from the (possibly un-normalized) function, so its per-block instruction lists may extend past the end
+    # of a displayed node (e.g., a trimmed blanket entry in the linear view, or a normalized block in the graph
+    # view, whose raw counterpart also contains the instructions of an overlapping jump-target block)
+    insn_addrs = []
+    for node in nodes:
+        node_insn_addrs = disasm.block_to_insn_addrs[node.addr]
+        size = getattr(node, "size", None)
+        if isinstance(size, int) and size > 0:
+            node_insn_addrs = [a for a in node_insn_addrs if node.addr <= a < node.addr + size]
+        insn_addrs.extend(node_insn_addrs)
 
-    lst = [ ]
+    lst = []
 
     variable_manager = disasm.kb.variables[func_addr]
 
     # function beginning
     if block_addr == func_addr:
-        # function header
-        func = disasm.kb.functions.get_by_addr(func_addr)
-        if func is not None and func.calling_convention is not None and func.prototype is not None:
-            args = func.calling_convention.arg_locs(func.prototype)
-            func_header = FunctionHeader(func.demangled_name, func.prototype, args)
+        func_header = get_function_header(disasm.kb.functions, func_addr)
+        if func_header is not None:
             lst.append(func_header)
 
         # stack variables
         # filter out all stack variables
-        variables = variable_manager.get_variables(sort='stack', collapse_same_ident=False)
+        variables = variable_manager.get_unified_variables(sort="stack")
         variables = sorted(variables, key=lambda v: v.offset)
         lst.append(Variables(variables))
 
@@ -92,12 +119,12 @@ def get_block_objects(disasm, nodes, func_addr):
     for insn_addr in insn_addrs:
         if insn_addr != func_addr and insn_addr in disasm.kb.labels:
             lst.append(Label(insn_addr, get_label_text(insn_addr, disasm.kb)))
-        lst.append(disasm.raw_result_map['instructions'][insn_addr])
-        lst.extend(disasm.raw_result_map['ir'][insn_addr])
+        lst.append(disasm.raw_result_map["instructions"][insn_addr])
+        lst.extend(disasm.raw_result_map["ir"][insn_addr])
 
     # initial label, if there is any
     # FIXME: all labels should be generated during CFG recovery, and this step should not be necessary.
-    if lst and not isinstance(lst[0], FunctionHeader):
+    if lst and not isinstance(lst[0], FunctionHeader | Label):
         # the first element should be a label
         lst.insert(0, Label(block_addrs[0], get_label_text(block_addrs[0], disasm.kb)))
 
@@ -116,23 +143,7 @@ def get_out_branches(supernode):
     return supernode.out_branches
 
 
-def address_to_text(addr, kb):
-    """
-    Properly convert an address to text for a label.
-
-    :param int addr: The address to convert.
-    :param angr.KnowledgeBase kb: The knowledgebase in use.
-    :return: Text representation of the address.
-    :rtype: str
-    """
-
-    if addr in kb.labels:
-        return kb.labels[addr]
-
-    return "loc_%#x" % addr
-
 def get_out_branches_for_insn(out_branch_dict, ins_addr):
-
     if ins_addr not in out_branch_dict:
         return None
 
@@ -151,32 +162,36 @@ def get_out_branches_for_insn(out_branch_dict, ins_addr):
         return next(iter(out_branch_map.values()))
 
 
-def fast_memory_load_pointer(project, addr, size=None):
+def fast_memory_load_pointer(project: Project, addr: int, size: int | None = None):
     try:
         return project.loader.memory.unpack_word(addr, size=size)
     except KeyError:
         return None
 
 
-def string_at_addr(cfg, addr, project, max_size=50):
+def string_at_addr(cfg, addr: int, project: Project, max_size: int = 50):
     try:
         mem_data = cfg.memory_data[addr]
     except KeyError:
         return None
 
     if mem_data.sort == "string":
+        if mem_data.content is None:
+            return None
         str_content = mem_data.content.decode("utf-8")
-    elif mem_data.sort == 'pointer-array':
+    elif mem_data.sort == "pointer-array":
         ptr = fast_memory_load_pointer(project, mem_data.address)
         try:
             next_level = cfg.memory_data[ptr]
         except KeyError:
             return None
 
-        if next_level.sort != 'string':
+        if next_level.sort != "string":
             return None
 
-        str_content = next_level.content.decode('utf-8')
+        if next_level.content is None:
+            return None
+        str_content = next_level.content.decode("utf-8")
     else:
         return None
 
@@ -189,20 +204,19 @@ def string_at_addr(cfg, addr, project, max_size=50):
         return None
 
 
-def should_display_string_label(cfg, insn_addr, project):
-
-    if not insn_addr in cfg.insn_addr_to_memory_data:
+def should_display_string_label(cfg, insn_addr, project: Project):
+    if insn_addr not in cfg.insn_addr_to_memory_data:
         return False
 
     memory_data = cfg.insn_addr_to_memory_data[insn_addr]
-    if memory_data.sort == 'string':
+    if memory_data.sort == "string":
         return True
-    elif memory_data.sort == 'pointer-array' and memory_data.size == cfg.project.arch.bytes:
+    elif memory_data.sort == "pointer-array" and memory_data.size == cfg.project.arch.bytes:
         # load the pointer
         ptr = fast_memory_load_pointer(project, memory_data.address)
         try:
             # see if the pointer is pointing to a string
-            return cfg.memory_data[ptr].sort == 'string'
+            return cfg.memory_data[ptr].sort == "string"
         except KeyError:
             return False
 
@@ -218,13 +232,12 @@ def filter_string_for_display(s):
     for ch in s.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t"):
         char = ord(ch)
         if not is_printable(char):
-            ch = "\\x%0.2x" % char
+            ch = f"\\x{char:02x}"
         output += ch
     return output
 
 
-def get_string_for_display(cfg, insn_addr, project, max_size=20) -> Optional[str]:
-
+def get_string_for_display(cfg, insn_addr, project: Project, max_size: int = 20) -> str | None:
     str_content = None
 
     try:
@@ -233,13 +246,18 @@ def get_string_for_display(cfg, insn_addr, project, max_size=20) -> Optional[str
         return None
 
     if memory_data.sort == "string":
-        str_content = memory_data.content.decode("utf-8")
-    elif memory_data.sort == 'pointer-array':
+        str_content = ""
+        if memory_data.content:
+            try:
+                str_content = memory_data.content.decode("utf-8")
+            except UnicodeDecodeError:
+                str_content = "<unicode-decoding-failure>"
+    elif memory_data.sort == "pointer-array":
         ptr = fast_memory_load_pointer(project, memory_data.address)
         if ptr in cfg.memory_data:
             next_level = cfg.memory_data[ptr]
-            if next_level.sort == 'string':
-                str_content = next_level.content.decode('utf-8')
+            if next_level.sort == "string":
+                str_content = next_level.content.decode("utf-8")
 
     if str_content is not None:
         if len(str_content) > max_size:
@@ -249,15 +267,9 @@ def get_string_for_display(cfg, insn_addr, project, max_size=20) -> Optional[str
     else:
         return None
 
+
 def get_comment_for_display(kb, insn_addr):
     if insn_addr in kb.comments:
         return kb.comments[insn_addr]
     else:
         return None
-
-def has_binsync():
-    try:
-        import binsync
-        return True
-    except ImportError:
-        return False

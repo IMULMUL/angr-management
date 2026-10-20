@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 try:
     import bintrace
     from bintrace.debugger_angr import get_angr_project_load_options_from_trace
@@ -12,7 +14,7 @@ class Trace:
 
     @property
     def source(self) -> str:
-        raise NotImplementedError()
+        raise NotImplementedError
 
     @classmethod
     def trace_backend_enabled(cls) -> bool:
@@ -27,16 +29,16 @@ class BintraceTrace(Trace):
     Bintrace execution trace.
     """
 
-    def __init__(self, trace: 'bintrace.Trace'):
+    def __init__(self, trace: bintrace.Trace) -> None:
         assert BintraceTrace.trace_backend_enabled()
-        self.trace: 'bintrace.Trace' = trace
+        self.trace: bintrace.Trace = trace
 
     @property
     def source(self) -> str:
         return self.trace.path
 
     @classmethod
-    def load_trace(cls, path: str) -> 'BintraceTrace':
+    def load_trace(cls, path: str) -> BintraceTrace:
         trace = bintrace.Trace()
         trace.load_trace(path)
         return cls(trace)

@@ -1,26 +1,47 @@
+from __future__ import annotations
 
-from .job import Job
+from typing import TYPE_CHECKING
+
+from angrmanagement.data.analysis_options import AnalysisConfiguration
+
+from .job import InstanceJob
+
+if TYPE_CHECKING:
+    from angrmanagement.data.instance import Instance
+    from angrmanagement.logic.jobmanager import JobContext
 
 
-class CodeTaggingJob(Job):
+class CodeTaggingConfiguration(AnalysisConfiguration):
+    """
+    Configuration for Code Tagging.
+    """
 
-    def __init__(self, on_finish=None):
-        super(CodeTaggingJob, self).__init__(name="Code tagging", on_finish=on_finish)
+    def __init__(self, instance: Instance) -> None:
+        super().__init__(instance)
+        self.name = "code_tagging"
+        self.display_name = "Tag Functions Based on Syntactic Features"
+        self.description = "Add tags to functions based on syntactic features in assembly code and referenced strings."
+        self.enabled = False
 
-    def _run(self, inst):
 
-        func_count = len(inst.kb.functions)
-        for i, func in enumerate(inst.kb.functions.values()):
-            ct = inst.project.analyses.CodeTagging(func)
+class CodeTaggingJob(InstanceJob):
+    """
+    Job for tagging functions.
+    """
+
+    def __init__(self, instance: Instance, on_finish=None) -> None:
+        super().__init__("Code tagging", instance, on_finish=on_finish)
+
+    def run(self, ctx: JobContext) -> None:
+        func_count = len(self.instance.kb.functions)
+        for i, func in enumerate(self.instance.kb.functions.values()):
+            if func.is_alignment:
+                continue
+            ct = self.instance.project.analyses.CodeTagging(func)
             func.tags = tuple(ct.tags)
 
             percentage = i / func_count * 100
-            text = "%.02f%%" % percentage
+            ctx.set_progress(percentage)
 
-            super()._progress_callback(percentage, text=text)
-
-    def finish(self, inst, result):
-        super(CodeTaggingJob, self).finish(inst, result)
-
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "CodeTaggingJob"

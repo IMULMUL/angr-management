@@ -1,17 +1,27 @@
-from typing import Optional, Tuple, Dict, Any, TYPE_CHECKING
+from __future__ import annotations
 
-from PySide2.QtGui import Qt
-from PySide2.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QDialogButtonBox, QLineEdit
+from typing import TYPE_CHECKING, Any
 
-import pycparser
-
-from angr.sim_variable import SimVariable
-from angr.analyses.decompiler.structured_codegen.c import CVariable, CConstruct
 import angr
+import pycparser
+from angr import SIM_TYPE_COLLECTIONS
+from angr.analyses.decompiler.structured_codegen import (
+    CodegenNode,
+    FunctionNode,
+    VariableNode,
+)
+from angr.errors import AngrMissingTypeError
+from angr.sim_variable import SimVariable
+from angr.utils.types import dereference_simtype, make_type_reference
+from PySide6.QtCore import QSize
+from PySide6.QtGui import QFont, Qt
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout
 
+from angrmanagement.config import Conf
 
 if TYPE_CHECKING:
     from angr.sim_type import SimType
+
     from angrmanagement.data.instance import Instance
     from angrmanagement.ui.views.code_view import CodeView
 
@@ -20,17 +30,19 @@ class TypeBox(QLineEdit):
     """
     Implements a line edit widget for inputting types.
     """
-    def __init__(self, textchanged_callback, predefined_types=None, parent=None):
+
+    def __init__(self, textchanged_callback, predefined_types=None, parent=None) -> None:
         super().__init__(parent)
 
-        self._cvariable: Optional[CVariable] = None
         self._predefined_types = predefined_types
 
-
         self.textChanged.connect(textchanged_callback)
+        self.setFont(QFont(Conf.disasm_font))
 
-    def set_type(self, type_: 'SimType', cvariable: CVariable=None):
-        self._cvariable = cvariable
+    def set_type(self, type_: SimType | None, cvariable: VariableNode = None) -> None:
+        if type_ is None:
+            self.setText("")
+            return
         if cvariable is not None and isinstance(cvariable.unified_variable, SimVariable):
             type_str = type_.c_repr(name=cvariable.unified_variable.name)
         else:
@@ -40,7 +52,7 @@ class TypeBox(QLineEdit):
     @property
     def type_str(self):
         text = self.text()
-        valid, _ = self._is_valid_type_str(text)
+        valid, _, _ = self._is_valid_type_str(text)
         if valid:
             return text.strip()
         return None
@@ -48,12 +60,12 @@ class TypeBox(QLineEdit):
     @property
     def sim_type(self):
         text = self.text()
-        valid, parsed_type = self._is_valid_type_str(text)
+        valid, _, parsed_type = self._is_valid_type_str(text)
         if valid:
             return parsed_type
         return None
 
-    def _is_valid_type_str(self, type_str: str) -> Tuple[bool,Optional['SimType']]:
+    def _is_valid_type_str(self, type_str: str) -> tuple[bool, str, SimType | None]:
         """
         We accept two forms of type strings. The user can either specify a full variable declaration, like "char var",
         or only specify a type string, like "char". This method first attempts to parse the string as a variable
@@ -67,23 +79,41 @@ class TypeBox(QLineEdit):
         try:
             defns = angr.sim_type.parse_defns(declaration, predefined_types=self._predefined_types)
         except pycparser.c_parser.ParseError:
-            defns = { }
+            defns = {}
         if len(defns) == 1:
-            return True, next(iter(defns.values()))
+            return True, "", next(iter(defns.values()))
 
         try:
             parsed_type = angr.sim_type.parse_type(type_str, predefined_types=self._predefined_types)
-            return True, parsed_type
         except pycparser.c_parser.ParseError:
-            return False, None
+            return False, "Invalid type declaration string", None
+
+        # once the type is parsed, try to convert it into a type reference and see if it resolves
+        ref_type = make_type_reference(parsed_type)
+
+        # try to dereference it using known type collections
+
+        try:
+            deref_type = dereference_simtype(ref_type, list(SIM_TYPE_COLLECTIONS.values()))
+            return True, "", deref_type
+        except AngrMissingTypeError as ex:
+            return False, f"Unknown type {ex.missing_type}", None
 
 
 class RetypeNode(QDialog):
     """
     A dialog for retyping nodes.
     """
-    def __init__(self, instance: 'Instance', code_view: Optional['CodeView']=None, node: Optional[CConstruct]=None,
-                 node_type=None, variable=None, parent=None):
+
+    def __init__(
+        self,
+        instance: Instance,
+        code_view: CodeView | None = None,
+        node: CodegenNode | None = None,
+        node_type=None,
+        variable=None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
 
         # initialization
@@ -99,8 +129,8 @@ class RetypeNode(QDialog):
         self._status_label = None
         self._ok_button: QPushButton = None
 
-        self.setWindowTitle('Specify a type')
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setWindowTitle("Specify a type")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
 
         self.main_layout = QVBoxLayout()
 
@@ -108,33 +138,36 @@ class RetypeNode(QDialog):
 
         self.setLayout(self.main_layout)
 
+    def sizeHint(self):  # pylint:disable=no-self-use
+        return QSize(600, 50)
+
     #
     # Private methods
     #
 
-    def _get_predefined_types(self) -> Dict[Any,'SimType']:
+    def _get_predefined_types(self) -> dict[Any, SimType]:
         # global types
         r = dict(self._instance.kb.types)
         # local types
         if not self._code_view.function.am_none:
             func_addr = self._code_view.function.addr
-            if (func_addr, 'pseudocode') in self._instance.kb.structured_code:
-                pseudocode_cache = self._instance.kb.structured_code[(func_addr, 'pseudocode')]
+            if (func_addr, "pseudocode") in self._instance.kb.decompilations:
+                pseudocode_cache = self._instance.kb.decompilations[(func_addr, "pseudocode")]
                 r.update(pseudocode_cache.local_types)
         return r
 
-    def _init_widgets(self):
-
-        # type label
+    def _init_widgets(self) -> None:
+        # Type label
 
         type_label = QLabel(self)
-        type_label.setText('New type')
+        type_label.setText("New type")
 
         type_box = TypeBox(self._on_type_changed, predefined_types=self._get_predefined_types(), parent=self)
         if self._node is not None:
-            if isinstance(self._node, CVariable) and self._node.unified_variable:
-                if self._node_type is not None:
-                    type_box.set_type(self._node_type, cvariable=self._node)
+            if isinstance(self._node, VariableNode) and self._node.unified_variable and self._node_type is not None:
+                type_box.set_type(self._node_type, cvariable=self._node)
+            elif isinstance(self._node, FunctionNode):
+                type_box.setText(self._node.functy.c_repr(name=self._node.demangled_name, full=True, name_parens=False))
 
             type_box.selectAll()
         self._type_box = type_box
@@ -154,7 +187,7 @@ class RetypeNode(QDialog):
         buttons.setStandardButtons(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
         buttons.accepted.connect(self._on_ok_clicked)
         buttons.rejected.connect(self._on_cancel_clicked)
-        self._ok_button = buttons.button(QDialogButtonBox.Ok)
+        self._ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         self._ok_button.setEnabled(False)
         self.main_layout.addWidget(buttons)
 
@@ -162,28 +195,29 @@ class RetypeNode(QDialog):
     # Event handlers
     #
 
-    def _on_type_changed(self, new_text):  # pylint:disable=unused-argument
+    def _on_type_changed(self, _) -> None:
         if self._type_box is None:
             # initialization is not done yet
             return
 
-        if self._type_box.type_str is None:
+        type_valid, reason, _ = self._type_box._is_valid_type_str(self._type_box.text())
+        if not type_valid:
             # the variable name is invalid
-            self._status_label.setText('Invalid')
-            self._status_label.setProperty('class', 'status_invalid')
+            self._status_label.setText(f"Invalid: {reason}")
+            self._status_label.setProperty("class", "status_invalid")
             self._ok_button.setEnabled(False)
         else:
-            self._status_label.setText('Valid')
-            self._status_label.setProperty('class', 'status_valid')
+            self._status_label.setText("Valid")
+            self._status_label.setProperty("class", "status_valid")
             self._ok_button.setEnabled(True)
 
         self._status_label.style().unpolish(self._status_label)
         self._status_label.style().polish(self._status_label)
 
-    def _on_ok_clicked(self):
+    def _on_ok_clicked(self) -> None:
         self.new_type = self._type_box.sim_type
         self.close()
 
-    def _on_cancel_clicked(self):
+    def _on_cancel_clicked(self) -> None:
         self.new_type = None
         self.close()

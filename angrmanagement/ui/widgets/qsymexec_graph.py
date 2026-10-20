@@ -1,21 +1,23 @@
-import logging
+from __future__ import annotations
 
-from PySide2.QtGui import QColor, QPen, QBrush
-from PySide2.QtCore import Qt, QPointF
+from typing import TYPE_CHECKING
 
-from ...utils.graph_layouter import GraphLayouter
+from PySide6.QtCore import Qt
+
+from angrmanagement.utils.graph_layouter import GraphLayouter
+
 from .qgraph import QZoomableDraggableGraphicsView
 
-l = logging.getLogger('ui.widgets.qpg_graph')
+if TYPE_CHECKING:
+    from angrmanagement.ui.workspace import Workspace
 
 
 class QSymExecGraph(QZoomableDraggableGraphicsView):
-
     LEFT_PADDING = 2000
     TOP_PADDING = 2000
 
-    def __init__(self, current_state, workspace, symexec_view, parent=None):
-        super(QSymExecGraph, self).__init__(parent=parent)
+    def __init__(self, current_state, workspace: Workspace, symexec_view, parent=None) -> None:
+        super().__init__(parent=parent)
 
         self.state = current_state
         self._symexec_view = symexec_view
@@ -24,7 +26,7 @@ class QSymExecGraph(QZoomableDraggableGraphicsView):
         self.blocks = set()
         self._edges = []
 
-        self._edge_paths = [ ]
+        self._edge_paths = []
 
         self.state.am_subscribe(self._watch_state)
 
@@ -33,15 +35,15 @@ class QSymExecGraph(QZoomableDraggableGraphicsView):
         return self._graph
 
     @graph.setter
-    def graph(self, v):
+    def graph(self, v) -> None:
         if v is not self._graph:
             self._graph = v
             self.reload()
 
-    def reload(self):
+    def reload(self) -> None:
         self.request_relayout()
 
-    def request_relayout(self):
+    def request_relayout(self) -> None:
         self._reset_scene()
         if self.graph is None:
             return
@@ -53,7 +55,7 @@ class QSymExecGraph(QZoomableDraggableGraphicsView):
 
         # remove all nodes
         self.blocks.clear()
-        #self.remove_all_children()
+        # self.remove_all_children()
         self._edge_paths = []
 
         node_sizes = {}
@@ -79,8 +81,8 @@ class QSymExecGraph(QZoomableDraggableGraphicsView):
         max_x += self.LEFT_PADDING
         min_y -= self.TOP_PADDING
         max_y += self.TOP_PADDING
-        width = (max_x - min_x) + 2 * self.LEFT_PADDING
-        height = (max_y - min_y) + 2 * self.TOP_PADDING
+        (max_x - min_x) + 2 * self.LEFT_PADDING
+        (max_y - min_y) + 2 * self.TOP_PADDING
 
         self._reset_view()
 
@@ -88,7 +90,7 @@ class QSymExecGraph(QZoomableDraggableGraphicsView):
     # Event handlers
     #
 
-    def keyPressEvent(self, event):
+    def keyPressEvent(self, event) -> None:
         """
 
         :param QKeyEvent event:
@@ -97,13 +99,13 @@ class QSymExecGraph(QZoomableDraggableGraphicsView):
 
         key = event.key()
 
-        if key == Qt.Key_Tab:
+        if key == Qt.Key.Key_Tab:
             self._symexec_view.switch_to_disassembly_view()
             event.accept()
 
         super().keyPressEvent(event)
 
-    def _watch_state(self, **kwargs):
+    def _watch_state(self, **_) -> None:
         for block in self.blocks:
             if block.get_state() == self.state:
                 block.selected = True
@@ -119,39 +121,3 @@ class QSymExecGraph(QZoomableDraggableGraphicsView):
     def _initial_position(self):
         ibr = self.scene().itemsBoundingRect()
         return ibr.center()
-
-    def _block_from_state(self, state):
-        for block in self.blocks:
-            if block.get_state() == state:
-                return block
-        return None
-
-    def _draw_edges(self, painter, topleft_point, bottomright_point):
-        for edge in self._edges:
-            edge_coords = edge.coordinates
-
-            color = QColor(0x70, 0x70, 0x70)
-            pen = QPen(color)
-            pen.setWidth(1.5)
-            painter.setPen(pen)
-
-            for from_, to_ in zip(edge_coords, edge_coords[1:]):
-                start_point = QPointF(*from_)
-                end_point = QPointF(*to_)
-                # optimization: don't draw edges that are outside of the current scope
-                if (start_point.x() > bottomright_point.x() or start_point.y() > bottomright_point.y()) and \
-                        (end_point.x() > bottomright_point.x() or end_point.y() > bottomright_point.y()):
-                    continue
-                elif (start_point.x() < topleft_point.x() or start_point.y() < topleft_point.y()) and \
-                        (end_point.x() < topleft_point.x() or end_point.y() < topleft_point.y()):
-                    continue
-                painter.drawPolyline((start_point, end_point))
-
-            # arrow
-            # end_point = self.mapToScene(*edges[-1])
-            end_point = (edge_coords[-1][0], edge_coords[-1][1])
-            arrow = [QPointF(end_point[0] - 3, end_point[1]), QPointF(end_point[0] + 3, end_point[1]),
-                     QPointF(end_point[0], end_point[1] + 6)]
-            brush = QBrush(color)
-            painter.setBrush(brush)
-            painter.drawPolygon(arrow)

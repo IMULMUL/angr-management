@@ -1,6 +1,13 @@
-from PySide2.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QDialogButtonBox
+from __future__ import annotations
 
-from ..widgets import QAddressInput
+from typing import TYPE_CHECKING
+
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QVBoxLayout
+
+from angrmanagement.ui.widgets import QAddressInput
+
+if TYPE_CHECKING:
+    from angrmanagement.ui.views import CodeView, DisassemblyView
 
 
 class JumpTo(QDialog):
@@ -8,17 +15,17 @@ class JumpTo(QDialog):
     Dialog to jump to an address.
     """
 
-    def __init__(self, disasm_view, parent=None):
+    def __init__(self, current_view: DisassemblyView | CodeView, parent=None) -> None:
         super().__init__(parent)
 
         # initialization
-        self._disasm_view = disasm_view
+        self._current_view = current_view
 
         self._address_box = None
         self._status_label = None
         self._ok_button = None
 
-        self.setWindowTitle('Jump to address')
+        self.setWindowTitle("Jump to address")
 
         self.main_layout = QVBoxLayout()
 
@@ -26,20 +33,17 @@ class JumpTo(QDialog):
 
         self.setLayout(self.main_layout)
 
-        self.show()
-
     #
     # Private methods
     #
 
-    def _init_widgets(self):
-
+    def _init_widgets(self) -> None:
         # address label
 
         address_label = QLabel(self)
-        address_label.setText('Address')
+        address_label.setText("Address")
 
-        address = QAddressInput(self._on_address_changed, self._disasm_view.workspace, parent=self)
+        address = QAddressInput(self._on_address_changed, self._current_view.instance, parent=self)
         self._address_box = address
 
         address_layout = QHBoxLayout()
@@ -57,7 +61,7 @@ class JumpTo(QDialog):
         buttons.setStandardButtons(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
         buttons.accepted.connect(self._on_ok_clicked)
         buttons.rejected.connect(self.close)
-        self._ok_button = buttons.button(QDialogButtonBox.Ok)
+        self._ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         self._ok_button.setEnabled(False)
         self.main_layout.addWidget(buttons)
 
@@ -65,25 +69,24 @@ class JumpTo(QDialog):
     # Event handlers
     #
 
-    def _on_address_changed(self, new_text):  # pylint: disable=unused-argument
-
+    def _on_address_changed(self, _) -> None:
         if self._address_box.target is None:
             # the address is invalid
 
-            self._status_label.setText('Invalid')
-            self._status_label.setProperty('class', 'status_invalid')
+            self._status_label.setText("Invalid")
+            self._status_label.setProperty("class", "status_invalid")
             self._ok_button.setEnabled(False)
         else:
-            self._status_label.setText('Valid')
-            self._status_label.setProperty('class', 'status_valid')
+            self._status_label.setText("Valid")
+            self._status_label.setProperty("class", "status_valid")
             self._ok_button.setEnabled(True)
 
         self._status_label.style().unpolish(self._status_label)
         self._status_label.style().polish(self._status_label)
 
-    def _on_ok_clicked(self):
+    def _on_ok_clicked(self) -> None:
         addr = self._address_box.target
         if addr is not None:
-            r = self._disasm_view.jump_to(addr)
+            r = self._current_view.jump_to(addr)
             if r:
                 self.close()

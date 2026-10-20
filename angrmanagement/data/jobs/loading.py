@@ -1,94 +1,206 @@
+from __future__ import annotations
 
-import cle
+import logging
+from typing import TYPE_CHECKING, Any
+
 import angr
 import archinfo
-try:
-    import archr
-except ImportError:
-    archr = None
+import cle
+from angr.angrdb import AngrDB
+from PySide6.QtWidgets import QMessageBox
 
-from .job import Job
-from ...logic.threads import gui_thread_schedule
-from ...ui.dialogs import LoadBinary
+from angrmanagement.logic.threads import gui_thread_schedule
+from angrmanagement.ui.dialogs import LoadBinary, SetEncryptionKeyDialog
+from angrmanagement.ui.dialogs.set_encryption_key import key_to_hex
+from angrmanagement.utils.cart_config import CART_CONFIG_KEY_OPTION, CART_CONFIG_PATH, load_cart_config_key
 
+from .job import InstanceJob
 
-class LoadTargetJob(Job):
-    """
-    Job to load archr target and angr project.
-    """
+if TYPE_CHECKING:
+    from angr.knowledge_base import KnowledgeBase
 
-    def __init__(self, target, on_finish=None):
-        super().__init__("Loading target", on_finish=on_finish)
-        self.target = target
-
-    def _run(self, inst):
-        self._progress_callback(5)
-        with self.target.build().start() as t:
-            self._progress_callback(10)
-            dsb = archr.arsenal.DataScoutBow(t)
-            apb = archr.arsenal.angrProjectBow(t, dsb)
-            partial_ld = apb.fire(return_loader=True, perform_relocations=False, load_debug_info=False)
-            self._progress_callback(50)
-            load_options, cfg_args, variable_recovery_args = gui_thread_schedule(LoadBinary.run, (partial_ld,))
-            if cfg_args is None:
-                return
-
-            # Create the project, load it, then record the image name on success
-            proj = apb.fire(use_sim_procedures=True, load_options=load_options)
-            self._progress_callback(95)
-            inst._reset_containers()
-            inst.project = proj
-            inst.project.am_event(cfg_args=cfg_args, variable_recovery_args=variable_recovery_args)
+    from angrmanagement.data.instance import Instance
+    from angrmanagement.logic.jobmanager import JobContext
 
 
-class LoadBinaryJob(Job):
+_l = logging.getLogger(__name__)
+
+
+class LoadBinaryJob(InstanceJob):
     """
     Job to display binary load dialog and create angr project.
     """
 
-    def __init__(self, fname, load_options=None, on_finish=None):
-        super().__init__("Loading file", on_finish=on_finish)
+    def __init__(self, instance: Instance, fname, load_options=None, on_finish=None) -> None:
+        super().__init__("Loading file", instance, on_finish=on_finish)
         self.load_options = load_options or {}
         self.fname = fname
 
-    def _run(self, inst):
-        self._progress_callback(5)
+    def run(self, ctx: JobContext) -> None:
+        ctx.set_progress(5)
 
+        # loading may have to be retried when the user supplies an encryption key for an encrypted file
+        retry = True
         partial_ld = None
-        try:
-            # Try automatic loading
-            partial_ld = cle.Loader(self.fname, perform_relocations=False, load_debug_info=False)
-        except archinfo.arch.ArchNotFound as e:
-            partial_ld = cle.Loader(self.fname, perform_relocations=False, load_debug_info=False, arch='x86')
-            gui_thread_schedule(LoadBinary.binary_arch_detect_failed, (self.fname, str(e)))
-        except cle.CLECompatibilityError:
-            # Continue loading as blob
-            pass
+        main_opts: dict[str, Any] = {"ignore_missing_arch": True}
+        while partial_ld is None and retry:
+            retry, partial_ld, main_opts = self._load_binary_as_partial_loader(main_opts)
 
         if partial_ld is None:
-            try:
-                # Try loading as blob; dummy architecture (x86) required, user will select proper arch
-                partial_ld = cle.Loader(self.fname, main_opts={'backend': 'blob', 'arch': 'x86'})
-            except cle.CLECompatibilityError:
-                # Failed to load executable, even as blob!
-                gui_thread_schedule(LoadBinary.binary_loading_failed, (self.fname,))
-                return
-
-        self._progress_callback(50)
-        new_load_options, cfg_args, variable_recovery_args = gui_thread_schedule(LoadBinary.run, (partial_ld, ))
-        if cfg_args is None:
+            _l.warning("Failed to load binary in Cle; partial_ld is None.")
+            gui_thread_schedule(LoadBinary.binary_loading_failed, (self.fname,))
             return
 
-        engine = None
-        if hasattr(new_load_options['arch'], 'pcode_arch'):
-            engine = angr.engines.UberEnginePcode
+        # ignore_missing_arch is only useful during the partial load
+        main_opts.pop("ignore_missing_arch", None)
+
+        ctx.set_progress(50)
+        # when an outer backend (e.g., CaRT) is in play, original_main_object is the outer object that wraps the real
+        # main object; otherwise it is the main object itself
+        original_main_object = partial_ld.original_main_object
+        new_load_options, simos = gui_thread_schedule(
+            LoadBinary.run,
+            (partial_ld,),
+            kwargs={
+                "suggested_backend": partial_ld.main_object.__class__,
+                "suggested_os_name": partial_ld.main_object.os,
+                "suggested_main_opts": main_opts,
+                "suggested_original_backend": original_main_object.__class__,
+                "suggested_main_filename": original_main_object.unpacked_name,
+            },
+        )
+        if new_load_options is None:
+            return
 
         self.load_options.update(new_load_options)
 
-        proj = angr.Project(self.fname, load_options=self.load_options, engine=engine)
-        self._progress_callback(95)
-        def callback():
-            inst._reset_containers()
-            inst.project.am_obj = proj
-            inst.project.am_event(cfg_args=cfg_args, variable_recovery_args=variable_recovery_args)
+        proj = angr.Project(self.fname, load_options=self.load_options, simos=simos)
+        ctx.set_progress(95)
+
+        def callback() -> None:
+            self.instance._reset_containers()
+            self.instance.project.am_obj = proj
+            self.instance.project.am_event()
+
         gui_thread_schedule(callback, ())
+
+    def _load_binary_as_partial_loader(self, main_opts: dict[str, Any]) -> tuple[bool, cle.Loader | None, dict]:
+        """
+        Attempt a partial load of self.fname.
+
+        :return:    A tuple of (should retry, the loader or None, the main options to use next).
+        """
+
+        load_as_blob = False
+        partial_ld = None
+
+        def _load_user_passphrase(backend_cls) -> bytes | None:
+            prompt = f"The encryption key does not work or does not exist for the CLE backend {backend_cls.__name__}."
+            # suggest the key the cart tool is configured with, if there is one. cle does not use it by itself.
+            enckey = load_cart_config_key()
+            if enckey is not None:
+                prompt += f"\nPre-filled with {CART_CONFIG_KEY_OPTION} from {CART_CONFIG_PATH}."
+
+            dialog = SetEncryptionKeyDialog(
+                prompt_msg=prompt,
+                initial_text="" if enckey is None else key_to_hex(enckey),
+            )
+            dialog.exec_()
+            return dialog.result
+
+        try:
+            # Try automatic loading
+            partial_ld = cle.Loader(
+                self.fname,
+                perform_relocations=False,
+                load_debug_info=False,
+                auto_load_libs=False,
+                main_opts=main_opts,
+            )
+        except archinfo.arch.ArchNotFound:
+            _l.warning("Could not identify binary architecture.")
+            partial_ld = None
+            load_as_blob = True
+        except cle.CLEInvalidEncryptionError as ex:
+            # it needs an encryption key, but the one we used (if any) does not work
+            if ex.backend is not None and ex.enckey_argname is not None:
+                # ask the user for a new key
+                enc_key: bytes | None = gui_thread_schedule(_load_user_passphrase, (ex.backend,))
+                if enc_key:
+                    main_opts[ex.enckey_argname] = enc_key
+                    return True, None, main_opts
+
+            _l.warning(
+                "Failed to load binary with user-specified encryption key or the encryption key is missing. "
+                "Attempted to use backend %s (and failed). "
+                "Loading it as a blob instead.",
+                ex.backend,
+            )
+            load_as_blob = True
+        except (cle.CLEInvalidFileFormatError, cle.CLECompatibilityError, cle.CLEError):
+            # Continue loading as blob
+            _l.debug("Try loading the binary as a blob.")
+            load_as_blob = True
+
+        if partial_ld is None and load_as_blob:
+            try:
+                # Try loading as blob; dummy architecture (x86) required, user will select proper arch
+                partial_ld = cle.Loader(self.fname, main_opts={"backend": "blob", "arch": "x86"})
+                main_opts = {}
+            except cle.CLECompatibilityError:
+                # Failed to load executable, even as blob! The caller reports the failure.
+                return False, None, main_opts
+
+        return False, partial_ld, main_opts
+
+
+class LoadAngrDBJob(InstanceJob):
+    """
+    Load an angr database file and return a new angr project.
+    """
+
+    def __init__(
+        self,
+        instance: Instance,
+        file_path: str,
+        kb_names: list[str],
+        other_kbs: dict[str, KnowledgeBase] | None = None,
+        extra_info: dict | None = None,
+        on_finish=None,
+    ) -> None:
+        super().__init__("Loading angr database", instance, on_finish=on_finish)
+        self.file_path = file_path
+        self.kb_names = kb_names
+        self.other_kbs = other_kbs
+        self.extra_info = extra_info
+        self.blocking = True
+
+        self.project = None
+
+    def run(self, ctx: JobContext) -> None:
+        ctx.set_progress(5)
+
+        # no connection pool: a pooled SQLite connection keeps the file open, and locked on Windows
+        angrdb = AngrDB(nullpool=True)
+        try:
+            proj = angrdb.load(
+                self.file_path, kb_names=self.kb_names, other_kbs=self.other_kbs, extra_info=self.extra_info
+            )
+        except angr.errors.AngrIncompatibleDBError as ex:
+            _l.critical("Failed to load the angr database because of compatibility issues.", exc_info=True)
+            gui_thread_schedule(
+                QMessageBox.critical,
+                (None, "Error", f"Failed to load the angr database because of compatibility issues.\nDetails: {ex}"),
+            )
+            return
+        except angr.errors.AngrDBError as ex:
+            _l.critical("Failed to load the angr database because of compatibility issues.", exc_info=True)
+            gui_thread_schedule(
+                QMessageBox.critical, (None, "Error", f"Failed to load the angr database.\nDetails: {ex}")
+            )
+            _l.critical("Failed to load the angr database.", exc_info=True)
+            return
+
+        self.project = proj
+
+        ctx.set_progress(100)

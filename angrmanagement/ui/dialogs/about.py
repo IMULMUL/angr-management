@@ -1,11 +1,13 @@
+from __future__ import annotations
+
 import os
 
-from PySide2.QtWidgets import QDialog, QLabel, QVBoxLayout, QHBoxLayout
-from PySide2.QtGui import QIcon, QPixmap, QFont
-from PySide2.QtCore import Qt
-import angr
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont, QIcon, QPixmap
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QVBoxLayout
 
-from ...config import IMG_LOCATION
+import angrmanagement
+from angrmanagement.consts import IMG_LOCATION
 
 
 class LoadAboutDialog(QDialog):
@@ -13,32 +15,33 @@ class LoadAboutDialog(QDialog):
     Dialog that shows application version, credits, etc.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.setWindowFlags(Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        self.setWindowTitle('About')
-        #mdiIcon
-        angr_icon_location = os.path.join(IMG_LOCATION, 'angr.png')
+        self.setWindowFlags(Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
+        self.setWindowTitle("About")
+        # mdiIcon
+        angr_icon_location = os.path.join(IMG_LOCATION, "angr.png")
         self.setWindowIcon(QIcon(angr_icon_location))
         self._init_widgets()
 
-    def _init_widgets(self):
+    def _init_widgets(self) -> None:
         # icon
         icon_label = QLabel(self)
-        icon_location = os.path.join(IMG_LOCATION, 'angr-ds.png')
+        icon_location = os.path.join(IMG_LOCATION, "angr-ds.png")
         angr_icon = QPixmap(icon_location)
         icon_label.setPixmap(angr_icon)
         # textbox
-        angr_text = QLabel("angr")
-        angr_text.setFont(QFont("Consolas", 24, weight=QFont.Bold))
-        version_text_tup = "Version: " + ".".join(str(x) for x in angr.__version__[0:4])
+        angr_text = QLabel("angr management")
+        angr_text.setFont(QFont("Consolas", 24, weight=QFont.Weight.Bold))
+        version_text_tup = "Version: " + angrmanagement.__version__
         version_text = QLabel(version_text_tup)
-        version_text.setFont(QFont("Consolas", weight=QFont.Bold))
-        version_text.setAlignment(Qt.AlignCenter)
-        credits_text = QLabel("<a href=\"http://angr.io/\">Credits</a>")
-        credits_text.setFont(QFont("Consolas", weight=QFont.Bold))
-        credits_text.setTextFormat(Qt.RichText)
-        credits_text.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        version_text.setFont(QFont("Consolas", weight=QFont.Weight.Bold))
+        version_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        version_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        credits_text = QLabel('<a href="http://angr.io/">Credits</a>')
+        credits_text.setFont(QFont("Consolas", weight=QFont.Weight.Bold))
+        credits_text.setTextFormat(Qt.TextFormat.RichText)
+        credits_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         credits_text.setOpenExternalLinks(True)
 
         structure = QVBoxLayout()

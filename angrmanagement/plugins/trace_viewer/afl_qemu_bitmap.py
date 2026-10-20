@@ -1,29 +1,36 @@
-import math
+from __future__ import annotations
+
 import logging
+import math
+from typing import TYPE_CHECKING
 
 import networkx as nx
-
 from angr.knowledge_plugins.functions import Function
+from PySide6.QtGui import QColor
 
-from PySide2.QtGui import QColor
+if TYPE_CHECKING:
+    from angrmanagement.ui.workspace import Workspace
 
 _l = logging.getLogger(name=__name__)
 
 
 class AFLQemuBitmap:
-
-    HIT_COLOR = QColor(0xee, 0xff, 0xee)
+    HIT_COLOR = QColor(0xEE, 0xFF, 0xEE)
     MISS_COLOR = QColor(0x99, 0x00, 0x00, 0x30)
     FUNCTION_NOT_VISITED_COLOR = QColor(0x99, 0x00, 0x00, 0x20)
-    BUCKET_COLORS = [QColor(0xef, 0x65, 0x48, 0x20), QColor(0xfc, 0x8d, 0x59, 0x60),
-                     QColor(0xfd, 0xbb, 0x84, 0x60), QColor(0xfd, 0xd4, 0x9e, 0x60)]
+    BUCKET_COLORS = [
+        QColor(0xEF, 0x65, 0x48, 0x20),
+        QColor(0xFC, 0x8D, 0x59, 0x60),
+        QColor(0xFD, 0xBB, 0x84, 0x60),
+        QColor(0xFD, 0xD4, 0x9E, 0x60),
+    ]
 
-    def __init__(self, workspace, bitmap, base_addr, bits_inverted=False):
+    def __init__(self, workspace: Workspace, bitmap, base_addr, bits_inverted: bool = False) -> None:
         self.workspace = workspace
         self.virgin_bitmap = bitmap
         if bits_inverted:
             # invert all bits
-            self.virgin_bitmap = bytes([ b ^ 0xff for b in self.virgin_bitmap ])
+            self.virgin_bitmap = bytes([b ^ 0xFF for b in self.virgin_bitmap])
         self.bitmap_size = len(self.virgin_bitmap)
         assert self.bitmap_size == 1 << (self.bitmap_size.bit_length() - 1)
         self.function_info = {}
@@ -31,19 +38,19 @@ class AFLQemuBitmap:
         self._node_hitcounts = {}
         self._node_hitcount_summary = {}
 
-        project = self.workspace.instance.project
+        project = self.workspace.main_instance.project
         self.project_baddr = project.loader.main_object.mapped_base
         self.runtime_baddr = base_addr
 
         self._compute_hitcounts()
 
-    def _compute_hitcounts(self):
-        func_manager = self.workspace.instance.project.kb.functions
+    def _compute_hitcounts(self) -> None:
+        func_manager = self.workspace.main_instance.project.kb.functions
         for func_addr in func_manager:
             func = func_manager[func_addr]
 
             hitc_g = self._parse_bitmap(func)
-            node_hitc = {n.addr: data['hitcount'] for n, data in hitc_g.nodes(data=True)}
+            node_hitc = {n.addr: data["hitcount"] for n, data in hitc_g.nodes(data=True)}
             self._hitcount_graphs[func] = hitc_g
             self._node_hitcounts[func] = node_hitc
             for addr, hitcount in node_hitc.items():
@@ -51,7 +58,7 @@ class AFLQemuBitmap:
                 new = max(old, hitcount)
                 self._node_hitcount_summary[addr] = new
 
-    def get_hit_miss_color(self, addr):
+    def get_hit_miss_color(self, addr: int):
         # TODO: sometimes there's addresses here that are not in the hitcount, don't know why
         hitcount = self._node_hitcount_summary.get(addr, 0)
         if hitcount == 0:
@@ -71,40 +78,38 @@ class AFLQemuBitmap:
 
         return self.function_info[func.addr]["coverage"]
 
-    def get_any_trace(self, addr):
+    def get_any_trace(self, addr: int):
         raise NotImplementedError
 
-    def runtime_to_project_addr(self, addr):
+    def runtime_to_project_addr(self, addr: int):
         return addr - self.runtime_baddr + self.project_baddr
 
-    def project_to_runtime_addr(self, addr):
+    def project_to_runtime_addr(self, addr: int):
         return addr - self.project_baddr + self.runtime_baddr
 
-    def addr_hash(self, addr):
+    def addr_hash(self, addr: int):
         return ((addr >> 4) ^ (addr << 8)) & (self.bitmap_size - 1)
 
     def possible_dynamic_basic_block_succs(self, g, node):
-
         # we return two types of edges, may_takes and fallthroughs
-        may_takes = [ ]
-        fallthroughs = [ ]
+        may_takes = []
+        fallthroughs = []
 
         out_edges = g.out_edges(node, data=True)
         for _, dst, data in out_edges:
-            type_ = data.get('type', 'transition')
-            if type_ == 'fake_return':
+            type_ = data.get("type", "transition")
+            if type_ == "fake_return":
                 fallthroughs.append(dst)
             else:
                 may_takes.append(dst)
         return may_takes, fallthroughs
 
     def _incoming_transition_edges(self, g, node):
-
         in_edges = g.in_edges(node, data=True)
-        r = [ ]
+        r = []
         for src, _, data in in_edges:
-            type_ = data.get('type', 'transition')
-            if type_ in ('transition', 'exception'):
+            type_ = data.get("type", "transition")
+            if type_ in ("transition", "exception"):
                 r.append((src, node))
         return r
 
@@ -128,12 +133,12 @@ class AFLQemuBitmap:
                 succ = may_takes[0]
                 hitcount_graph.add_node(succ)
                 hitcount_graph.add_edge(node, succ, hitcount=1)  # it may not be 1 but it's hard to figure out the real
-                                                                 # number
+                # number
                 _l.debug("%r -> %r (single successor, no fallthrough)", node, succ)
                 if len(self._incoming_transition_edges(func_graph, succ)) > 1:
                     _l.debug("... %r is probably a result of graph normalization.", succ)
                     worklist.append((succ, node.addr))  # the actual address for AFL address hashing is the address of
-                                                        # node
+                    # node
                 else:
                     _l.debug("... %r is the target of a jump.", succ)
                     worklist.append((succ, None))
@@ -175,16 +180,16 @@ class AFLQemuBitmap:
             done.add(node)
 
         for node in hitcount_graph.nodes():
-            succ_hitcount = sum(data['hitcount'] for o, data in hitcount_graph.succ[node].items())
-            pred_hitcount = sum(data['hitcount'] for o, data in hitcount_graph.pred[node].items())
+            succ_hitcount = sum(data["hitcount"] for o, data in hitcount_graph.succ[node].items())
+            pred_hitcount = sum(data["hitcount"] for o, data in hitcount_graph.pred[node].items())
 
             node_hitc = max(succ_hitcount, pred_hitcount)
             _l.debug("Marking node %r with hitcount %d", repr(node), node_hitc)
-            hitcount_graph.nodes[node]['hitcount'] = node_hitc
+            hitcount_graph.nodes[node]["hitcount"] = node_hitc
 
         return hitcount_graph
 
-    def _calc_function_info(self, func):
+    def _calc_function_info(self, func) -> None:
         node_hitcounts = self._node_hitcounts[func]
 
         block_addrs = list(func.block_addrs)

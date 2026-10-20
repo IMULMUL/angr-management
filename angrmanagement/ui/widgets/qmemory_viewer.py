@@ -1,30 +1,33 @@
-import logging
+from __future__ import annotations
 
-from PySide2.QtWidgets import QFrame, QLabel, QVBoxLayout, QHBoxLayout, QScrollArea, QLineEdit,\
-    QWidget
-from PySide2.QtGui import QPainter, QBrush, QPen
-from PySide2.QtCore import Qt, QSize
+from typing import TYPE_CHECKING
 
-from ...config import Conf
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QPainter
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QLineEdit, QScrollArea, QVBoxLayout, QWidget
+
+from angrmanagement.config import Conf
+
 from .qast_viewer import QASTViewer
 
-l = logging.getLogger('ui.widgets.qregister_viewer')
+if TYPE_CHECKING:
+    from angrmanagement.ui.workspace import Workspace
 
 
-class AddressPiece(object):
-    __slots__ = ['address']
+class AddressPiece:
+    __slots__ = ["address"]
 
-    def __init__(self, address):
+    def __init__(self, address) -> None:
         self.address = address
 
 
-class NewLinePiece(object):
+class NewLinePiece:
     pass
 
 
 class QMemoryView(QWidget):
-    def __init__(self, state, workspace, parent=None):
-        super(QMemoryView, self).__init__(parent)
+    def __init__(self, state, workspace: Workspace, parent=None) -> None:
+        super().__init__(parent)
         self.workspace = workspace
 
         self.state = state
@@ -34,20 +37,19 @@ class QMemoryView(QWidget):
         # The current address being displayed. Must be set through .address
         self._address = None
 
-        self._objects = [ ]
+        self._objects = []
 
     @property
     def address(self):
         return self._address
 
     @address.setter
-    def address(self, v):
+    def address(self, v) -> None:
         if v != self._address:
             self._address = v
             self._reload_objects()
 
     def paintEvent(self, event):
-
         if self.address is None:
             return
 
@@ -57,14 +59,12 @@ class QMemoryView(QWidget):
 
         painter = QPainter(self)
 
-        painter.setPen(QPen(Qt.black, 1))
         painter.setFont(Conf.symexec_font)
 
         x = MARGIN_LEFT
         y = MARGIN_TOP
 
         for obj in self._objects:
-
             obj_type = type(obj)
 
             if obj_type is NewLinePiece:
@@ -73,32 +73,33 @@ class QMemoryView(QWidget):
                 y += Conf.symexec_font_height + LINE_MARGIN
             elif obj_type is AddressPiece:
                 # address
-                addr_str = "%08x" % obj.address
+                painter.setPen(Conf.memory_viewer_address_color)
+                addr_str = f"{obj.address:08x}"
                 painter.drawText(x, y + Conf.symexec_font_ascent, addr_str)
                 x += Conf.symexec_font_width * len(addr_str)
                 x += 7
             elif obj_type is QASTViewer:
-                # AST viewer
+                # AST viewer (memory data)
+                painter.setPen(Conf.memory_viewer_data_color)
                 obj.x = x
                 obj.y = y
                 obj.paint(painter)
 
                 x += obj.width + 2
             else:
-                raise TypeError('paintEvent(): Unsupported object type %s.' % obj_type)
+                raise TypeError(f"paintEvent(): Unsupported object type {obj_type}.")
 
-    def _reload_objects(self):
+    def _reload_objects(self) -> None:
         """
         Reload addresses and text pieces to be displayed.
 
         :return: None
         """
 
-        objects = [ ]
+        objects = []
 
         addr_base = self.address
         for row in range(self.rows):
-
             addr = addr_base + row * self.cols
 
             # address
@@ -119,13 +120,12 @@ class QMemoryView(QWidget):
 
 
 class QMemoryViewer(QFrame):
-    def __init__(self, state, parent, workspace):
-        super(QMemoryViewer, self).__init__(parent)
+    def __init__(self, state, parent, workspace: Workspace) -> None:
+        super().__init__(parent)
         self.workspace = workspace
 
-        self._scrollarea = None  # type: QScrollArea
-        self._txt_addr = None  # type: QLineEdit
-        self._view = None  # type: QMemoryView
+        self._txt_addr: QLineEdit
+        self._view: QMemoryView
 
         self._addr = None  # the address to display
         self.state = state
@@ -139,8 +139,7 @@ class QMemoryViewer(QFrame):
         return self._addr
 
     @addr.setter
-    def addr(self, v):
-
+    def addr(self, v) -> None:
         if self._addr != v:
             self._addr = v
 
@@ -150,14 +149,14 @@ class QMemoryViewer(QFrame):
     # Overridden methods
     #
 
-    def sizeHint(self, *args, **kwargs):
+    def sizeHint(self):
         return QSize(100, 100)
 
     #
     # Public methods
     #
 
-    def reload(self):
+    def reload(self) -> None:
         if self.state.am_none:
             return
 
@@ -170,7 +169,7 @@ class QMemoryViewer(QFrame):
     # Event handlers
     #
 
-    def _on_address_entered(self):
+    def _on_address_entered(self) -> None:
         address_str = self._txt_addr.text()
 
         try:
@@ -184,7 +183,7 @@ class QMemoryViewer(QFrame):
     # Private methods
     #
 
-    def _init_widgets(self):
+    def _init_widgets(self) -> None:
         layout = QVBoxLayout()
 
         # address
@@ -203,9 +202,8 @@ class QMemoryViewer(QFrame):
         self._view = QMemoryView(self.state, self.workspace)
 
         area = QScrollArea()
-        self._scrollarea = area
-        area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         area.setWidgetResizable(True)
 
         area.setWidget(self._view)
@@ -216,12 +214,12 @@ class QMemoryViewer(QFrame):
 
         self.setLayout(layout)
 
-    def _refresh_memory_view(self):
+    def _refresh_memory_view(self) -> None:
         self._view.cols = 16
         self._view.rows = 10
         self._view.address = self.addr
 
         self._view.repaint()
 
-    def _watch_state(self, **kwargs):
+    def _watch_state(self, **kwargs) -> None:
         self.reload()

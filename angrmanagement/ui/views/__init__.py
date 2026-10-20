@@ -1,21 +1,62 @@
-from .view import BaseView
+from __future__ import annotations
+
+from .bookmarks_view import BookmarksView
+from .breakpoints_view import BreakpointsView
+from .call_explorer_view import CallExplorerView
+from .code_view import CodeView
+from .comments_view import CommentsView
+from .console_view import ConsoleView
+from .data_dep_view import DataDepView
+from .dep_view import DependencyView
 from .disassembly_view import DisassemblyView
-from .symexec_view import SymexecView
 from .functions_view import FunctionsView
+from .hex_view import HexView
+from .jobs_view import JobsView
+from .log_view import LogView
+from .mcp_history_view import MCPHistoryView
+from .patches_view import PatchesView
+from .pattern_view import PatternView
+from .proximity_view import ProximityView
+from .registers_view import RegistersView
+from .search_view import SearchView
+from .signatures_view import SignaturesView
+from .stack_view import StackView
 from .states_view import StatesView
 from .strings_view import StringsView
-from .console_view import ConsoleView
-from .code_view import CodeView
-from .interaction_view import InteractionView
-from .patches_view import PatchesView
-from .dep_view import DependencyView
-from .proximity_view import ProximityView
-from .types_view import TypesView
-from .hex_view import HexView
-from .log_view import LogView
-from .data_dep_view import DataDepView
-from .registers_view import RegistersView
-from .stack_view import StackView
-from .traces_view import TracesView
+from .symexec_view import SymexecView
 from .trace_map_view import TraceMapView
-from .breakpoints_view import BreakpointsView
+from .traces_view import TracesView
+from .types_view import TypesView
+from .view import BaseView, InstanceView
+
+__all__ = [
+    "BookmarksView",
+    "PatternView",
+    "BreakpointsView",
+    "CallExplorerView",
+    "CodeView",
+    "CommentsView",
+    "ConsoleView",
+    "DataDepView",
+    "DependencyView",
+    "DisassemblyView",
+    "FunctionsView",
+    "HexView",
+    "JobsView",
+    "LogView",
+    "MCPHistoryView",
+    "PatchesView",
+    "ProximityView",
+    "RegistersView",
+    "SearchView",
+    "StackView",
+    "StatesView",
+    "StringsView",
+    "SymexecView",
+    "SignaturesView",
+    "TraceMapView",
+    "TracesView",
+    "TypesView",
+    "BaseView",
+    "InstanceView",
+]

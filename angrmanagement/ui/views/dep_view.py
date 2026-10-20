@@ -1,59 +1,64 @@
-from typing import Dict, Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import networkx
-
-from PySide2.QtWidgets import QHBoxLayout
-from PySide2.QtCore import QSize
-
-from angr.knowledge_plugins.key_definitions.definition import Definition
-from angr.knowledge_plugins.key_definitions.atoms import Atom
-from angr.analyses.reaching_definitions.external_codeloc import ExternalCodeLocation
 from angr import SIM_PROCEDURES
+from angr.code_location import ExternalCodeLocation
+from PySide6.QtCore import QSize
+from PySide6.QtWidgets import QHBoxLayout
 
-from ..widgets.qdep_graph import QDependencyGraph
-from ..widgets.qdepgraph_block import QDepGraphBlock
-from .view import BaseView
+from angrmanagement.ui.widgets.qdep_graph import QDependencyGraph
+from angrmanagement.ui.widgets.qdepgraph_block import QDepGraphBlock
+
+from .view import InstanceView
+
+if TYPE_CHECKING:
+    from angr.knowledge_plugins.key_definitions.atoms import Atom
+    from angr.knowledge_plugins.key_definitions.definition import Definition
+
+    from angrmanagement.data.instance import Instance
+    from angrmanagement.ui.workspace import Workspace
 
 
-class DependencyView(BaseView):
+class DependencyView(InstanceView):
     """
     Creates view for dependency analysis.
     """
 
-    def __init__(self, workspace, default_docking_position, *args, **kwargs):
-        super().__init__('dependencies', workspace, default_docking_position, *args, **kwargs)
+    def __init__(self, workspace: Workspace, default_docking_position: str, instance: Instance) -> None:
+        super().__init__("dependencies", workspace, default_docking_position, instance)
 
-        self.base_caption = 'Dependencies'
-        self.workspace = workspace
+        self.base_caption = "Dependencies"
 
         # UI widgets
         self._graph_widget: QDependencyGraph = None
 
         # data
-        self.sink_atom: Optional[Atom] = None
-        self.sink_ins_addr: Optional[int] = None
-        self.closures: Optional[Dict[Definition,networkx.DiGraph]] = None
-        self._graph: Optional[networkx.DiGraph] = None
-        self.hovered_block: Optional[QDepGraphBlock] = None
+        self.sink_atom: Atom | None = None
+        self.sink_ins_addr: int | None = None
+        self.closures: dict[Definition, networkx.DiGraph] | None = None
+        self._graph: networkx.DiGraph | None = None
+        self.hovered_block: QDepGraphBlock | None = None
 
         self._init_widgets()
         self._register_events()
 
-    def hover_enter_block(self, block: QDepGraphBlock):
+    def hover_enter_block(self, block: QDepGraphBlock) -> None:
         self.hovered_block = block
         if self._graph_widget is not None:
             self._graph_widget.on_block_hovered(block)
         self.redraw_graph()
 
-    def hover_leave_block(self):
+    def hover_leave_block(self) -> None:
         self.hovered_block = None
         self.redraw_graph()
 
-    def on_screen_changed(self):
+    def on_screen_changed(self) -> None:
         if self._graph_widget is not None:
             self._graph_widget.refresh()
 
-    def reload(self):
+    def reload(self) -> None:
         if self._graph_widget is None:
             return
         # re-generate the graph
@@ -66,16 +71,15 @@ class DependencyView(BaseView):
         self._graph = self._create_ui_graph()
         self._graph_widget.graph = self._graph
 
-    def redraw_graph(self):
+    def redraw_graph(self) -> None:
         if self._graph_widget is not None:
             self._graph_widget.viewport().update()
 
     def sizeHint(self):
         return QSize(400, 800)
 
-    def _init_widgets(self):
-
-        self._graph_widget = QDependencyGraph(self.workspace, self)
+    def _init_widgets(self) -> None:
+        self._graph_widget = QDependencyGraph(self.instance, self)
 
         hlayout = QHBoxLayout()
         hlayout.addWidget(self._graph_widget)
@@ -83,10 +87,10 @@ class DependencyView(BaseView):
 
         self.setLayout(hlayout)
 
-    def _register_events(self):
+    def _register_events(self) -> None:
         self.workspace.current_screen.am_subscribe(self.on_screen_changed)
 
-    def _convert_node(self, node: Definition, converted: Dict[Definition,QDepGraphBlock]) -> Optional[QDepGraphBlock]:
+    def _convert_node(self, node: Definition, converted: dict[Definition, QDepGraphBlock]) -> QDepGraphBlock | None:
         if node in converted:
             return converted[node]
 
@@ -94,19 +98,20 @@ class DependencyView(BaseView):
         if isinstance(node.codeloc, ExternalCodeLocation):
             return None
 
-        if self.workspace.instance.project.is_hooked(node.codeloc.block_addr):
-            hook = self.workspace.instance.project.hooked_by(node.codeloc.block_addr)
-            if isinstance(hook, (SIM_PROCEDURES['stubs']['UnresolvableJumpTarget'],
-                                 SIM_PROCEDURES['stubs']['UnresolvableCallTarget'])):
+        if self.instance.project.is_hooked(node.codeloc.block_addr):
+            hook = self.instance.project.hooked_by(node.codeloc.block_addr)
+            if isinstance(
+                hook,
+                SIM_PROCEDURES["stubs"]["UnresolvableJumpTarget"] | SIM_PROCEDURES["stubs"]["UnresolvableCallTarget"],
+            ):
                 return None
 
         new_node = QDepGraphBlock(False, self, definition=node, addr=node.codeloc.ins_addr)
         converted[node] = new_node
         return new_node
 
-    #def _is_edge_in_graph(self):
+    # def _is_edge_in_graph(self):
     def _create_ui_graph(self) -> networkx.DiGraph:
-
         g = networkx.DiGraph()
         source_node = QDepGraphBlock(False, self, atom=self.sink_atom, addr=self.sink_ins_addr)
         g.add_node(source_node)

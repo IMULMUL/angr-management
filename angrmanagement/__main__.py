@@ -1,249 +1,307 @@
 # pylint:disable=import-outside-toplevel,unused-import,no-member
+from __future__ import annotations
+
 import asyncio
-import sys
-import os
 import ctypes
-import threading
+import glob
+import multiprocessing
+import os
+import signal
+import sys
 import time
 import warnings
-import platform
-import signal
 
-def shut_up(*args, **kwargs):
+from PySide6.QtCore import QThread, QTimer
+from PySide6.QtWidgets import QApplication
+
+from . import __version__
+
+if sys.platform.startswith("darwin"):
+    from Foundation import NSBundle  # pylint: disable=import-error
+
+
+def shut_up(*args, **kwargs) -> None:  # pylint:disable=unused-argument
     return
+
+
 warnings.simplefilter = shut_up
+EVENT_PROFILING = os.getenv("AM_EVENT_PROFILING", "no").lower() in ("1", "true", "yes")
+STALL_WATCHDOG = os.getenv("AM_STALL_WATCHDOG", "no").lower() in ("1", "true", "yes")
 
 
-BUGGY_PYSIDE2_VERSIONS = [
-    "5.12.1",  # https://github.com/angr/angr-management/issues/59
-    "5.14.2",  # Tiffany reported. Verified. Probably caused by
-               # https://code.qt.io/cgit/pyside/pyside-setup.git/commit/?h=5.14&id=52299827c64cccc1456f9050fdf3dd8596df3e6f
-    "5.14.2.1",  # deadlocks sometimes, although better than 5.14.2
-]
+name: str = "angr-management"
 
 
-def check_dependencies_qt():
+class QProfilingApplication(QApplication):
+    """
+    A QApplication wrapper class that profiles notify() calls and warns about slow events.
+    """
 
-    missing_dep = False
-
-    try:
-        import PySide2
-    except ImportError:
-        PySide2 = None
-        sys.stderr.write("Cannot find the PySide2 package. You may install it via pip:\n" +
-                         "    pip install pyside2\n")
-        missing_dep = True
-
-    # version check
-    if PySide2 is not None and PySide2.__version__ in BUGGY_PYSIDE2_VERSIONS:
-        sys.stderr.write("Your installed version of PySide2 is known to have bugs that may lead to angr management "
-                         "crashing. Please switch to other versions.\n"
-                         "A known good version of PySide2 is 5.14.1. You may install it via pip:\n"
-                         "    pip install -U pyside2==5.14.1\n")
-        sys.stderr.write("Bad PySide2 versions include: %s" % ", ".join(BUGGY_PYSIDE2_VERSIONS))
-        missing_dep = True
-
-    try:
-        import qtconsole
-    except ImportError:
-        sys.stderr.write("Cannot find the qtconsole package. You may install it via pip:\n" +
-                         "    pip install qtconsole\n")
-        missing_dep = True
-
-    return not missing_dep
+    def notify(self, receiver, event):
+        t0 = time.perf_counter()
+        try:
+            return super().notify(receiver, event)
+        finally:
+            dt = (time.perf_counter() - t0) * 1000
+            if dt > 100:
+                print(f"[slow] {dt:.0f} ms  {event.type()!r}  {receiver.__class__.__name__}  {repr(receiver)}")
+                parent = receiver.parent() if hasattr(receiver, "parent") else None
+                if parent is not None:
+                    print(f"  parent={parent.__class__.__name__ if parent else None}")
 
 
-def check_dependencies():
-
-    missing_dep = False
-
-    try:
-        import sqlalchemy
-    except ImportError:
-        sys.stderr.write("Cannot find the sqlalchemy package. You may install it via pip:\n" +
-                         "    pip install sqlalchemy\n")
-        missing_dep = True
-
-    try:
-        import pyqodeng.core
-    except ImportError:
-        sys.stderr.write("Cannot find the pyqodeng.core package. You may install it via pip:\n" +
-                         "    pip install pyqodeng.core\n")
-        missing_dep = True
-
-    try:
-        import xdg
-    except ImportError:
-        sys.stderr.write("Cannot find the xdg package. You may install it via pip:\n" +
-                         "    pip install pyxdg\n")
-        missing_dep = True
-
-    try:
-        import requests
-    except ImportError:
-        sys.stderr.write("Cannot find the requests package. You may install it via pip:\n" +
-                         "    pip install requests\n")
-        missing_dep = True
-
-    return not missing_dep
-
-
-def set_app_user_model_id():
+def set_app_user_model_id() -> None:
     # Explicitly call SetCurrentProcessExplicitAppUserModelID() so the taskbar icon is displayed correctly.
 
-    if sys.platform == 'win32':
+    if sys.platform == "win32":
         winver = sys.getwindowsversion()
         if winver.major >= 5:
-            myappid = u'angr-management'
+            myappid = name.replace(" ", "-")
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
 
-def set_windows_event_loop_policy():
-    if sys.platform == 'win32':
+def set_windows_event_loop_policy() -> None:
+    if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
-def macos_bigsur_wants_layer():
-    # workaround for https://bugreports.qt.io/browse/QTBUG-87014
-    # this is because the latest PySide2 (5.15.2) does not include this fix
-    v, _, _ = platform.mac_ver()
-    vs = v.split(".")
-    if len(vs) >= 2:
-        major, minor = list(map(int, vs[:2]))
-    else:
-        return
-    if major >= 11 or major == 10 and minor == 16:
-        os.environ['QT_MAC_WANTS_LAYER'] = '1'
-
-
-def start_management(filepath=None, use_daemon=None, profiling=False):
-
-    if sys.platform == "darwin":
-        macos_bigsur_wants_layer()
-
-    if not check_dependencies_qt():
-        # it's likely that other dependencies are also missing. check them here before exiting.
-        check_dependencies()
-        sys.exit(1)
-
+def start_management(
+    filepath=None,
+    use_daemon=None,
+    profiling: bool = False,
+    use_mcp=None,
+    mcp_port=None,
+    mcp_auth=None,
+    mcp_auth_token=None,
+) -> None:
     set_app_user_model_id()
     set_windows_event_loop_policy()
 
-    from PySide2.QtWidgets import QApplication, QSplashScreen, QMessageBox
-    from PySide2.QtGui import QFontDatabase, QPixmap, QIcon
-    from PySide2.QtCore import Qt, QCoreApplication
+    from PySide6.QtCore import QMargins, QRectF, Qt
+    from PySide6.QtGui import QCursor, QFontDatabase, QGuiApplication, QIcon, QPixmap
+    from PySide6.QtWidgets import QSplashScreen
 
-    from .config import FONT_LOCATION, IMG_LOCATION, Conf
+    from .consts import FONT_LOCATION, IMG_LOCATION
 
-    # Enable High-DPI support
-    # https://stackoverflow.com/questions/35714837/how-to-get-sharp-ui-on-high-dpi-with-qt-5-6
-    if ("QT_DEVICE_PIXEL_RATIO" not in os.environ
-        and "QT_AUTO_SCREEN_SCALE_FACTOR" not in os.environ
-        and "QT_SCALE_FACTOR" not in os.environ
-        and "QT_SCREEN_SCALE_FACTORS" not in os.environ
-        ):
-        QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
-    # No more rounding
-    # https://github.com/pyqtgraph/pyqtgraph/issues/756
-    # https://lists.qt-project.org/pipermail/development/2019-September/037434.html
-    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
-    # Use highDPI pixmaps
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
+    class SplashScreen(QSplashScreen):
+        """
+        angr-management splash screen, showing version, a progress bar, and progress status message.
 
-    app = QApplication(sys.argv)
-    app.setApplicationDisplayName("angr management")
-    app.setApplicationName("angr management")
-    icon_location = os.path.join(IMG_LOCATION, 'angr.png')
+        Note: Progress message is distinct from the one provided by QSplashScreen::showMessage.
+        """
+
+        _progress: float = 0.0
+        _progress_message: str = ""
+
+        def setProgress(self, progress: float, progress_message: str | None = None) -> None:
+            self._progress = progress
+            if self._progress_message is not None:
+                self._progress_message = progress_message
+            self.repaint()
+
+        def drawContents(self, painter) -> None:
+            super().drawContents(painter)
+            contentsRect = self.contentsRect()
+
+            # Draw progress bar
+            pbar_height = 3
+            pbar_width = contentsRect.width() * max(0.0, min(self._progress, 1.0))
+            painter.setPen(Qt.GlobalColor.transparent)
+            painter.setBrush(Qt.GlobalColor.white)
+            painter.drawRect(QRectF(0, contentsRect.height() - pbar_height, pbar_width, pbar_height))
+
+            # Draw version and status text
+            pad = 6
+            r = contentsRect.marginsRemoved(QMargins(pad, pad, pad, pad + pbar_height))
+            painter.setPen(Qt.GlobalColor.white)
+            painter.drawText(r, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight, __version__)
+            painter.drawText(r, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft, self._progress_message)
+
+    # Fix app title on macOS
+    if sys.platform.startswith("darwin"):
+        try:
+            bundle = NSBundle.mainBundle()
+            info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+            info["CFBundleName"] = name
+        except Exception as e:  # pylint: disable=broad-except
+            # This happens before logging is set up so use stderr
+            print(f"Failed to set App name! {type(e).__name__}: {e}", file=sys.stderr)
+
+    app = QProfilingApplication(sys.argv) if EVENT_PROFILING else QApplication(sys.argv)
+
+    # Qt calls Python overrides (paint(), event handlers) one at a time, and each must win the GIL
+    # back from any busy worker thread; at the default 5 ms interval a repaint can take seconds.
+    sys.setswitchinterval(0.0005)
+
+    # set up custom GC logic; GC must not run on angr's worker/analysis threads.
+    import gc as _gc
+
+    _gc.disable()
+    # Collect the young generation often (cheap) and do a full generation-2 sweep rarely (it
+    # can briefly pause the GUI on large heaps). Both timers are parented to app, so they run
+    # on the GUI thread and Qt keeps them (and their wrappers) alive.
+    _gc_young_timer = QTimer(app)
+    _gc_young_timer.timeout.connect(lambda: _gc.collect(0))
+    _gc_young_timer.start(1000)
+    _gc_full_timer = QTimer(app)
+    _gc_full_timer.timeout.connect(lambda: _gc.collect(2))
+    _gc_full_timer.start(20000)
+
+    app.setApplicationDisplayName(name)
+    app.setApplicationName(name)
+    icon_location = os.path.join(IMG_LOCATION, "angr.png")
     QApplication.setWindowIcon(QIcon(icon_location))
 
-    # try to import the initial configuration for the install
-    Conf.attempt_importing_initial_config()
-
     # Make + display splash screen
-    splashscreen_location = os.path.join(IMG_LOCATION, 'angr-splash.png')
+    splashscreen_location = os.path.join(IMG_LOCATION, "angr-splash.png")
     splash_pixmap = QPixmap(splashscreen_location)
-    splash = QSplashScreen(splash_pixmap, Qt.WindowStaysOnTopHint)
-    icon_location = os.path.join(IMG_LOCATION, 'angr.png')
+    current_screen = QGuiApplication.screenAt(QCursor.pos())
+    splash = SplashScreen(current_screen, splash_pixmap, Qt.WindowType.WindowStaysOnTopHint)
+    splash.setFixedSize(splash_pixmap.size())
+
+    icon_location = os.path.join(IMG_LOCATION, "angr.png")
     splash.setWindowIcon(QIcon(icon_location))
-    splash.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+    splash.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
     splash.setEnabled(False)
     splash.show()
     for _ in range(5):
         time.sleep(0.01)
         app.processEvents()
 
-    if not check_dependencies():
-        sys.exit(1)
+    splash.setProgress(0.1, "Loading configuration")
 
-    from .ui.css import refresh_theme  # import .ui after shwing the splash screen since it's going to take time
+    from .config import Conf
 
-    refresh_theme()
+    # try to import the initial configuration for the install
+    Conf.attempt_importing_initial_config()
 
+    splash.setProgress(0.2, "Importing modules")
     import angr
 
-    angr.loggers.profiling_enabled = True if profiling else False
-
     from .logic import GlobalInfo
+    from .ui.awesome_tooltip_event_filter import QAwesomeTooltipEventFilter
+    from .ui.css import refresh_theme  # import .ui after showing the splash screen since it's going to take time
     from .ui.main_window import MainWindow
 
-    # Load fonts
-    QFontDatabase.addApplicationFont(os.path.join(FONT_LOCATION, "SourceCodePro-Regular.ttf"))
-    QFontDatabase.addApplicationFont(os.path.join(FONT_LOCATION, "DejaVuSansMono.ttf"))
+    angr.loggers.profiling_enabled = bool(profiling)
 
-    # Initialize font-related configuration
+    splash.setProgress(0.5, "Configuring theme")
+    refresh_theme()
+
+    # Load fonts, initialize font-related configuration
+    for font_file in glob.glob(os.path.join(FONT_LOCATION, "*.ttf")):
+        QFontDatabase.addApplicationFont(font_file)
     Conf.init_font_config()
-    # Set global font
-    app.setFont(Conf.ui_default_font)
+    Conf.connect("ui_default_font", app.setFont, True)
 
-    GlobalInfo.gui_thread = threading.get_ident()
+    # install the global tooltip filter
+    app.installEventFilter(QAwesomeTooltipEventFilter(app))
 
+    splash.setProgress(0.8, "Load type libraries")
+    angr.procedures.definitions.load_all_definitions()
+
+    splash.setProgress(0.9, "Initializing main window")
+    GlobalInfo.gui_thread = QThread.currentThread()
     file_to_open = filepath if filepath else None
-    main_window = MainWindow(app=app, use_daemon=use_daemon)
+    if mcp_port is not None:
+        Conf.mcp_server_port = mcp_port
+    if mcp_auth:
+        Conf.mcp_server_auth_enabled = True
+    if mcp_auth_token is not None:
+        Conf.mcp_server_auth_enabled = True
+        Conf.mcp_server_auth_token = mcp_auth_token
+    main_window = MainWindow(app=app, use_daemon=use_daemon, use_mcp=use_mcp)
+    QApplication.processEvents()  # Let the main window start up to correctly position early dialogs
+
+    splash.setProgress(1.0, "")
     splash.finish(main_window)
 
     if file_to_open is not None:
         main_window.load_file(file_to_open)
 
+    main_window.initialized = True
+    main_window.workspace.view_manager.main_window_initialized()
+
+    if file_to_open is None:
+        main_window.show_welcome_dialog()
+
+    if STALL_WATCHDOG:
+        # start the stall watchdog
+        from .logic.stall_watchdog import StallWatchdog
+
+        GlobalInfo.stall_watchdog = StallWatchdog(app=app, tick_ms=20, stall_ms=150)
+
     app.exec_()
 
 
-def main():
+def main() -> None:
     import argparse
+
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-    parser = argparse.ArgumentParser(description="angr management")
+    prog: str = name.replace(" ", "-")
+    parser = argparse.ArgumentParser(prog=prog, description=name)
+    parser.add_argument("-v", "--version", action="version", version=f"{prog} {__version__}")
     parser.add_argument("-s", "--script", type=str, help="run a python script in the (commandline) angr environment")
-    parser.add_argument("-i", "--interactive", action='store_true', help="interactive (ipython) mode")
-    parser.add_argument("-n", "--no-gui", action='store_true', help="run in headless mode")
-    parser.add_argument('-d', "--with-daemon", action='store_true', help="use angr with the daemon. this allows angr "
-                                                                         "to handle angr:// URLs. it will "
-                                                                         "automatically start a daemon if there isn't "
-                                                                         "already one running.")
-    parser.add_argument("-D", "--daemon", action='store_true', help="start a daemon to handle angr:// URLs.")
-    parser.add_argument("-u", "--url", type=str, nargs='?', help="(internal) handle angr:// URLs. "
-                                                                 "the daemon must be running.")
-    parser.add_argument("-p", "--profiling", action='store_true', help="display profiling log messages.")
-    parser.add_argument('-R', '--autoreload', action='store_true', help="Reload all python modules on each job start.")
+    parser.add_argument("-i", "--interactive", action="store_true", help="interactive (ipython) mode")
+    parser.add_argument("-n", "--no-gui", action="store_true", help="run in headless mode")
+    parser.add_argument(
+        "-d",
+        "--with-daemon",
+        action="store_true",
+        help="use angr with the daemon. this allows angr "
+        "to handle angr:// URLs. it will "
+        "automatically start a daemon if there isn't "
+        "already one running.",
+    )
+    parser.add_argument("-D", "--daemon", action="store_true", help="start a daemon to handle angr:// URLs.")
+    parser.add_argument(
+        "-u", "--url", type=str, nargs="?", help="(internal) handle angr:// URLs. the daemon must be running."
+    )
+    parser.add_argument("-p", "--profiling", action="store_true", help="display profiling log messages.")
+    parser.add_argument(
+        "-m",
+        "--mcp",
+        action="store_true",
+        help="start the MCP server so AI agents can analyze the loaded binary and show results in the GUI.",
+    )
+    parser.add_argument("--mcp-port", type=int, help="the port for the MCP server (default: 8642).")
+    parser.add_argument(
+        "--mcp-auth",
+        action="store_true",
+        help="require a bearer token to connect to the MCP server. A token is generated and "
+        "saved if one is not already configured.",
+    )
+    parser.add_argument(
+        "--mcp-auth-token",
+        type=str,
+        help="require this specific bearer token to connect to the MCP server (implies --mcp-auth).",
+    )
+    parser.add_argument("-R", "--autoreload", action="store_true", help="Reload all python modules on each job start.")
     parser.add_argument("binary", nargs="?", help="the binary to open (for the GUI)")
 
     args = parser.parse_args()
 
     if args.autoreload:
         from .logic import GlobalInfo
+
         GlobalInfo.autoreload = True
 
     if args.daemon:
         from .daemon import start_daemon
+
         start_daemon()
         return
     elif args.url:
-        from .daemon import daemon_exists, handle_url, run_daemon_process, daemon_conn
+        from .daemon import daemon_conn, daemon_exists, handle_url, run_daemon_process
+
         if not daemon_exists():
             run_daemon_process()
             time.sleep(1)
 
         # initialize plugins
         from .plugins import PluginManager
+
         PluginManager(None).discover_and_initialize_plugins()
 
         action = handle_url(args.url, act=False)
@@ -251,17 +309,26 @@ def main():
         return
     if args.script:
         import runpy
-        script_globals = runpy.run_path(args.script)
+
+        runpy.run_path(args.script)  # pylint:disable=unused-variable
     if args.interactive:
         if args.script:
             print("Your script's globals() dict is available in the `script_globals` variable.")
         import IPython
+
         IPython.embed(banner1="")
     if not args.no_gui:
-        start_management(args.binary,
-                         use_daemon=True if args.with_daemon else None,
-                         profiling=True if args.profiling else None)
+        start_management(
+            args.binary,
+            use_daemon=True if args.with_daemon else None,
+            profiling=True if args.profiling else None,
+            use_mcp=True if args.mcp else None,
+            mcp_port=args.mcp_port,
+            mcp_auth=True if args.mcp_auth else None,
+            mcp_auth_token=args.mcp_auth_token,
+        )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()

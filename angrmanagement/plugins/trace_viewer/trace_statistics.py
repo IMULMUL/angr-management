@@ -1,34 +1,42 @@
 # pylint:disable=missing-class-docstring
+from __future__ import annotations
+
 import logging
 import os
 import random
-from collections import defaultdict
 from bisect import bisect_left
-from typing import Dict, Any, List, Set, Optional
-
-from PySide2.QtGui import QColor
+from collections import defaultdict
+from typing import TYPE_CHECKING, Any
 
 from angr.errors import SimEngineError
+from PySide6.QtGui import QColor
 
-l = logging.getLogger(name=__name__)
-l.setLevel('DEBUG')
+if TYPE_CHECKING:
+    from angrmanagement.ui.workspace import Workspace
+
+log = logging.getLogger(name=__name__)
 
 
 class TraceFunc:
+    __slots__ = (
+        "bbl_addr",
+        "func_name",
+        "func",
+    )
 
-    __slots__ = ('bbl_addr', 'func_name', 'func', )
-
-    def __init__(self, bbl_addr=None, func_name=None, func=None):
+    def __init__(self, bbl_addr=None, func_name: str | None = None, func=None) -> None:
         self.bbl_addr = bbl_addr
         self.func_name = func_name
         self.func = func
 
 
 class ObjectAndBase:
+    __slots__ = (
+        "obj_name",
+        "base_addr",
+    )
 
-    __slots__ = ('obj_name', 'base_addr', )
-
-    def __init__(self, obj_name: str, base_addr: int):
+    def __init__(self, obj_name: str, base_addr: int) -> None:
         self.obj_name = obj_name
         self.base_addr = base_addr
 
@@ -37,38 +45,35 @@ class ObjectAndBase:
             return self.base_addr < other.base_addr
         elif isinstance(other, int):
             return self.base_addr < other
-        raise TypeError("Unsupported type %s" % type(other))
+        raise TypeError(f"Unsupported type {type(other)}")
 
 
 class TraceStatistics:
-
-    BBL_FILL_COLOR = QColor(0, 0xf0, 0xf0, 0xf)
-    BBL_BORDER_COLOR = QColor(0, 0xf0, 0xf0)
     BBL_EMPTY_COLOR = QColor("white")
 
-    def __init__(self, workspace, trace, baddr):
+    def __init__(self, workspace: Workspace, trace, baddr) -> None:
         self.workspace = workspace
-        self.trace: Dict[str,Any] = trace
+        self.trace: dict[str, Any] = trace
         self.bbl_addrs = trace["bb_addrs"]
         self.syscalls = trace["syscalls"]
         self.id = trace["id"]
         self.created_at = trace["created_at"]
         self.input_id = trace["input_id"]
         self.complete = trace["complete"]
-        self.mapping: Optional[List[ObjectAndBase]] = None
-        if 'map' in trace:
-            map_dict: Dict[str,int] = trace["map"]
+        self.mapping: list[ObjectAndBase] | None = None
+        if "map" in trace:
+            map_dict: dict[str, int] = trace["map"]
             self.mapping = [ObjectAndBase(name, base_addr) for name, base_addr in map_dict.items()]
-            self.mapping = list(sorted(self.mapping, key=lambda o: o.base_addr))  # sort it based on base addresses
-        self.trace_func: List[TraceFunc] = []
-        self.func_addr_in_trace: Set[int] = set()
+            self.mapping = sorted(self.mapping, key=lambda o: o.base_addr)  # sort it based on base addresses
+        self.trace_func: list[TraceFunc] = []
+        self.func_addr_in_trace: set[int] = set()
         self._func_color = {}
         self.count = None
         self._mark_color = {}
         self._positions = defaultdict(list)
         self.mapped_trace = []
 
-        self.project = self.workspace.instance.project
+        self.project = self.workspace.main_instance.project
         if self.project.am_none:
             self.project_baddr = None
         else:
@@ -76,11 +81,11 @@ class TraceStatistics:
             self.project_baddr = self.project.loader.main_object.mapped_base
         self.runtime_baddr = baddr  # this will not be used if self.mapping is available
 
-        self._cached_object_project_base_addrs: Dict[str,int] = {}
+        self._cached_object_project_base_addrs: dict[str, int] = {}
 
         self._statistics(self.bbl_addrs)
 
-    def find_object_base_in_project(self, object_name: str) -> Optional[int]:
+    def find_object_base_in_project(self, object_name: str) -> int | None:
         """
         Find the base address of an object in angr project. Returns None if the project is not mapped. Results are
         cached in self._cached_object_project_base_addrs.
@@ -106,12 +111,14 @@ class TraceStatistics:
                 break
 
         if base_addr is None:
-            l.warning("Cannot find object %s in angr project. Maybe it has not been loaded. Exclude it from the "
-                      "trace.", object_name)
+            log.warning(
+                "Cannot find object %s in angr project. Maybe it has not been loaded. Exclude it from the trace.",
+                object_name,
+            )
         self._cached_object_project_base_addrs[object_name] = base_addr
         return base_addr
 
-    def get_func_color(self, func_name):
+    def get_func_color(self, func_name: str):
         if func_name in self._func_color:
             return self._func_color[func_name]
         else:
@@ -119,19 +126,19 @@ class TraceStatistics:
             self._func_color[func_name] = color
         return color
 
-    def set_mark_color(self, p, color):
+    def set_mark_color(self, p, color) -> None:
         self._mark_color[p] = color
 
-    def get_mark_color(self, addr, i):
+    def get_mark_color(self, addr: int, i):
         try:
             mark_index = self._get_position(addr, i)
             mark_color = self._mark_color[mark_index]
         except (IndexError, KeyError) as e:
-            l.error(e)
+            log.error(e)
             return self.BBL_EMPTY_COLOR
         return mark_color
 
-    def get_positions(self, addr):
+    def get_positions(self, addr: int):
         return self._positions[addr]
 
     def get_count(self, ins):
@@ -140,13 +147,10 @@ class TraceStatistics:
     def get_bbl_from_position(self, position):
         return self.trace_func[position].bbl_addr
 
-    def get_func_name_from_position(self, position):
-        return self.trace_func[position].func_name
-
     def get_func_from_position(self, position):
         return self.trace_func[position].func
 
-    def _apply_trace_offset(self, addr) -> Optional[int]:
+    def _apply_trace_offset(self, addr: int) -> int | None:
         if self.mapping is not None and self.mapping:
             # find the base address that this address belongs to
             idx = bisect_left(self.mapping, addr)
@@ -178,21 +182,21 @@ class TraceStatistics:
             # this object is probably created before an angr project is created. just give up.
             return None
 
-    def _statistics(self, trace_addrs):
+    def _statistics(self, trace_addrs) -> None:
         """
         :param trace: basic block address list
         """
-        self.mapped_trace = [ ]
+        self.mapped_trace = []
         for addr in trace_addrs:
             converted_addr = self._apply_trace_offset(addr)
             if converted_addr is not None:
                 self.mapped_trace.append(converted_addr)
 
         bbls = filter(self._get_bbl, self.mapped_trace)
-        functions = self.workspace.instance.project.kb.functions
+        functions = self.workspace.main_instance.project.kb.functions
 
         for p, bbl_addr in enumerate(bbls):
-            node = self.workspace.instance.cfg.get_any_node(bbl_addr)
+            node = self.workspace.main_instance.cfg.get_any_node(bbl_addr)
             # if node is None:  # try again without assuming node is start of a basic block
             #     node = self.workspace.instance.cfg.get_any_node(bbl_addr, anyaddr=True)
 
@@ -202,7 +206,7 @@ class TraceStatistics:
                     instr_addrs = node.instruction_addrs
                 else:
                     # relift
-                    block = self.workspace.instance.project.factory.block(bbl_addr)
+                    block = self.workspace.main_instance.project.factory.block(bbl_addr)
                     instr_addrs = block.instruction_addrs
                 for addr in instr_addrs:
                     self._positions[addr].append(p)
@@ -217,7 +221,7 @@ class TraceStatistics:
             else:
                 # Node is not found in the CFG. It's possible that the library is not loaded
                 func_name = hex(bbl_addr)  # default to using bbl_addr as name if none is not found
-                # l.warning("Node at %x is None, using bbl_addr as function name", bbl_addr)
+                # log.warning("Node at %x is None, using bbl_addr as function name", bbl_addr)
             self.trace_func.append(TraceFunc(bbl_addr, func_name, func))
 
             if p % 5000 == 0:
@@ -226,17 +230,17 @@ class TraceStatistics:
         print("Trace is loaded.")
         self.count = len(self.trace_func)
 
-    def _get_bbl(self, addr):
+    def _get_bbl(self, addr: int):
         try:
-            return self.workspace.instance.project.factory.block(addr)
+            return self.workspace.main_instance.project.factory.block(addr)
         except SimEngineError:
             return None
 
     def _func_addr(self, a):
-        return self.workspace.instance.cfg.get_any_node(a).function_address
+        return self.workspace.main_instance.cfg.get_any_node(a).function_address
 
     def _func_name(self, a):
-        return self.workspace.instance.project.kb.functions[self._func_addr(a)].demangled_name
+        return self.workspace.main_instance.project.kb.functions[self._func_addr(a)].demangled_name
 
     @staticmethod
     def _random_color():
@@ -245,5 +249,5 @@ class TraceStatistics:
         b = random.randint(0, 255)
         return QColor(r, g, b)
 
-    def _get_position(self, addr, i):
+    def _get_position(self, addr: int, i):
         return self._positions[addr][i]

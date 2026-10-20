@@ -1,17 +1,19 @@
-import logging
+from __future__ import annotations
 
-from PySide2.QtWidgets import QFrame, QLabel, QVBoxLayout, QHBoxLayout, QScrollArea, QSizePolicy
-from PySide2.QtCore import Qt, QSize
+from typing import TYPE_CHECKING
+
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QVBoxLayout
 
 from .qast_viewer import QASTViewer
 
-l = logging.getLogger('ui.widgets.qvextemps_viewer')
+if TYPE_CHECKING:
+    from angrmanagement.ui.workspace import Workspace
 
 
 class QVEXTempsViewer(QFrame):
-
-    def __init__(self, state, parent, workspace):
-        super(QVEXTempsViewer, self).__init__(parent)
+    def __init__(self, state, parent, workspace: Workspace) -> None:
+        super().__init__(parent)
         self.workspace = workspace
 
         self.state = state
@@ -26,18 +28,17 @@ class QVEXTempsViewer(QFrame):
     # Overridden methods
     #
 
-    def sizeHint(self, *args, **kwargs):
+    def sizeHint(self):
         return QSize(100, 100)
 
     #
     # Private methods
     #
 
-    def _init_widgets(self):
-
+    def _init_widgets(self) -> None:
         area = QScrollArea()
-        area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         area.setWidgetResizable(True)
 
         self._area = area
@@ -46,25 +47,22 @@ class QVEXTempsViewer(QFrame):
         base_layout.addWidget(area)
         self.setLayout(base_layout)
 
-    def _load_tmps(self):
+    def _load_tmps(self) -> None:
         state = self.state.am_obj
 
         layout = QVBoxLayout()
 
         self._tmps.clear()
-        if state is None:
-            tmps = {}
-        else:
-            tmps = state.scratch.temps
+        tmps = {} if state is None else state.scratch.temps
 
         # tmps
         for tmp_id, tmp_value in tmps.items():
             sublayout = QHBoxLayout()
 
             lbl_tmp_name = QLabel(self)
-            lbl_tmp_name.setProperty('class', 'reg_viewer_label')
-            lbl_tmp_name.setText("tmp_%d" % tmp_id)
-            lbl_tmp_name.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            lbl_tmp_name.setProperty("class", "reg_viewer_label")
+            lbl_tmp_name.setText(f"tmp_{tmp_id}")
+            lbl_tmp_name.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             sublayout.addWidget(lbl_tmp_name)
 
             sublayout.addSpacing(10)
@@ -83,11 +81,11 @@ class QVEXTempsViewer(QFrame):
         container = QFrame()
         container.setAutoFillBackground(True)
         palette = container.palette()
-        palette.setColor(container.backgroundRole(), Qt.white)
+        palette.setColor(container.backgroundRole(), Qt.GlobalColor.white)
         container.setPalette(palette)
         container.setLayout(layout)
 
         self._area.setWidget(container)
 
-    def _watch_state(self, **kwargs):
+    def _watch_state(self, **_) -> None:
         self._load_tmps()

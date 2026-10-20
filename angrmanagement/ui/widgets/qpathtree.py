@@ -1,20 +1,24 @@
-import weakref
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import networkx
-from PySide2.QtWidgets import QFrame, QHBoxLayout
-from PySide2.QtCore import QSize
+from PySide6.QtCore import QSize
+from PySide6.QtWidgets import QFrame, QHBoxLayout
 
-from .qsymexec_graph import QSymExecGraph
 from .qstate_block import QStateBlock
+from .qsymexec_graph import QSymExecGraph
 
+if TYPE_CHECKING:
+    from angrmanagement.ui.workspace import Workspace
 
-l = logging.getLogger('ui.widgets.qpathtree')
+log = logging.getLogger(__name__)
 
 
 class QPathTree(QFrame):
-    def __init__(self, simgr, state, symexec_view, workspace, parent=None):
-        super(QPathTree, self).__init__(parent=parent)
+    def __init__(self, simgr, state, symexec_view, workspace: Workspace, parent=None) -> None:
+        super().__init__(parent=parent)
 
         self.symexec_view = symexec_view
         self.workspace = workspace
@@ -32,11 +36,11 @@ class QPathTree(QFrame):
     # Public methods
     #
 
-    def reload(self):
+    def reload(self) -> None:
         if self.simgr.am_none:
             return
 
-        states = [state for (stash, states) in self.simgr.stashes.items() if stash != 'pruned' for state in states]
+        states = [state for (stash, states) in self.simgr.stashes.items() if stash != "pruned" for state in states]
         hierarchy = self.simgr._hierarchy
 
         graph = self._generate_graph([state.history for state in states], hierarchy, self.symexec_view)
@@ -47,7 +51,7 @@ class QPathTree(QFrame):
     # Initialization
     #
 
-    def _init_widgets(self):
+    def _init_widgets(self) -> None:
         graph = QSymExecGraph(self.state, self.workspace, self.symexec_view, parent=self)
 
         self._graph = graph
@@ -70,31 +74,7 @@ class QPathTree(QFrame):
     #
 
     @staticmethod
-    def _all_paths(paths, hierarchy):
-        work = set(paths)
-        seen = set()
-        while len(work) > 0:
-            path = work.pop()
-            # print(path.path_id)
-            if not hierarchy.history_contains(path.history) or len(hierarchy.history_successors(path.history)) == 0:
-                if path.path_id not in seen:
-                    yield path
-                    seen.add(path.path_id)
-            # get parents
-            if hierarchy.history_contains(path.history):
-                parents = hierarchy.history_predecessors(path.history)
-                for parent_history in parents:
-                    # assume _path_mapping always has the path
-                    parent_path = hierarchy._path_mapping[parent_history]
-                    work.add(parent_path)
-                    if len(hierarchy.history_successors(parent_history)) > 1:
-                        if parent_path.path_id not in seen:
-                            yield parent_path
-                            seen.add(parent_path.path_id)
-
-    @staticmethod
     def _all_edges_gen(state_histories, hierarchy):
-
         # TODO: reduce duplication with above function
         work = set(state_histories)
         while len(work) > 0:
@@ -112,19 +92,17 @@ class QPathTree(QFrame):
                         yield (parent_history, bot_history)
                         work.add(parent_history)
                         break
-                    else:
-                        working_history = parent_history
+                    working_history = parent_history
                 except KeyError:
                     # the parent history is not found in the path mapping
-                    l.error('Parent history %s is not found', parent_history)
+                    log.error("Parent history %s is not found", parent_history)
                     break
 
     @staticmethod
     def _generate_graph(state_histories, hierarchy, symexec_view):
-
         g = networkx.DiGraph()
 
-        history_to_block = { }
+        history_to_block = {}
 
         for state_history in state_histories:
             if state_history not in history_to_block:
@@ -140,5 +118,5 @@ class QPathTree(QFrame):
 
         return g
 
-    def _watch_simgr(self, **kwargs):
+    def _watch_simgr(self, **kwargs) -> None:
         self.reload()

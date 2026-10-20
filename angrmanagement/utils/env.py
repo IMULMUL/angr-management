@@ -1,7 +1,7 @@
-from typing import Union, List
+from __future__ import annotations
 
-import sys
 import os
+import sys
 
 
 def is_pyinstaller() -> bool:
@@ -10,10 +10,10 @@ def is_pyinstaller() -> bool:
     :return:    True if we are running as a PyInstaller-packaged program. False if we are running in Python directly
                 (e.g., development mode).
     """
-    return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
+    return getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
 
 
-def app_path(pythonw=None, as_list=False) -> Union[str,List[str]]:
+def app_path(pythonw=None, as_list: bool = False) -> str | list[str]:
     """
     Return the path of the application.
 
@@ -42,7 +42,7 @@ def app_path(pythonw=None, as_list=False) -> Union[str,List[str]]:
             return [python_path, "-m", "angrmanagement"]
         else:
             if " " in python_path:
-                python_path = '"%s"' % python_path
+                python_path = f'"{python_path}"'
             app_path = python_path + " -m angrmanagement"
             return app_path
 

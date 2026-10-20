@@ -1,25 +1,27 @@
-from typing import List
+from __future__ import annotations
 
-from PySide2.QtWidgets import QAbstractItemView, QHeaderView, QTableView
-from PySide2.QtCore import Qt, QAbstractTableModel
+from typing import TYPE_CHECKING
 
 from angr.knowledge_plugins.variables.variable_access import VariableAccess
 from angr.knowledge_plugins.xrefs.xref import XRef, XRefType
+from PySide6.QtCore import QAbstractTableModel, Qt
+from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableView
 
+from angrmanagement.config import Conf
 
-from ...config import Conf
+if TYPE_CHECKING:
+    from angrmanagement.data.instance import Instance
 
 
 class XRefMode:
-    Variable = 'variable'
-    Address = 'address'
+    Variable = "variable"
+    Address = "address"
 
 
 class QXRefModel(QAbstractTableModel):
+    HEADER = []
 
-    HEADER = [ ]
-
-    def __init__(self, addr, instance, view):
+    def __init__(self, addr: int | None, instance: Instance, view) -> None:
         super().__init__()
 
         self.addr = addr
@@ -27,14 +29,14 @@ class QXRefModel(QAbstractTableModel):
         self.view = view
 
     @property
-    def xrefs(self):
-        return self.view.items  # type: List[VariableAccess]
+    def xrefs(self) -> list[VariableAccess]:
+        return self.view.items
 
     @xrefs.setter
-    def xrefs(self, v):
+    def xrefs(self, v) -> None:
         self.view.items = v
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.xrefs)
 
     def rowCount(self, parent=None):
@@ -71,19 +73,20 @@ class QXRefModel(QAbstractTableModel):
 
         return None
 
-    def sort(self, column, order):
+    def sort(self, column, order) -> None:
         self.layoutAboutToBeChanged.emit()
 
         self.xrefs = sorted(
             self.xrefs,
-            key=lambda x: self._get_column_data(x, column), reverse=order == Qt.DescendingOrder,
+            key=lambda x: self._get_column_data(x, column),
+            reverse=order == Qt.SortOrder.DescendingOrder,
         )
         self.layoutChanged.emit()
 
-    def _get_column_text(self, xref, idx):
+    def _get_column_text(self, xref, idx: int):
         if idx < len(self.HEADER):
             data = self._get_column_data(xref, idx)
-            if type(data) is int:
+            if isinstance(data, int):
                 return hex(data)
             return data
 
@@ -91,13 +94,12 @@ class QXRefModel(QAbstractTableModel):
     # Abstract methods
     #
 
-    def _get_column_data(self, xref, idx):
-        raise NotImplementedError()
+    def _get_column_data(self, xref, idx: int):
+        raise NotImplementedError
 
 
 class QXRefVariableModel(QXRefModel):
-
-    HEADER = [('Direction', 70), ('Type', 50), ('Variable', 80), ('VarId', 80), ('PC', 80), ('Text', 300)]
+    HEADER = [("Direction", 70), ("Type", 50), ("Variable", 80), ("VarId", 80), ("PC", 160), ("Text", 300)]
 
     DIRECTION_COL = 0
     TYPE_COL = 1
@@ -106,7 +108,7 @@ class QXRefVariableModel(QXRefModel):
     PC_COL = 4
     TEXT_COL = 5
 
-    def _get_column_data(self, ref, idx):
+    def _get_column_data(self, ref, idx: int):
         """
 
         :param VariableAccess ref:
@@ -118,21 +120,31 @@ class QXRefVariableModel(QXRefModel):
             self.TYPE_COL: self._access_type,
             self.VARIABLE_COL: self._varname,
             self.VARID_COL: self._identstr,
-            self.PC_COL: lambda _r: _r.location.ins_addr,
+            self.PC_COL: self._addrstr,
             self.TEXT_COL: self._text,
         }
 
-        handler = mapping.get(idx, None)
+        handler = mapping.get(idx)
         if handler is not None:
             return handler(ref)
         return None
 
-    def _direction(self, _r):
+    def _addrstr(self, _r):
+        addr = _r.location.ins_addr
+        node = self.instance.cfg.get_any_node(addr, anyaddr=True)
+        if node is not None and node.function_address is not None:
+            return f"{addr:#x} ({self.instance.kb.functions[node.function_address].name})"
+        return hex(addr)
+
+    def _direction(self, _r) -> str:
         """
 
         :param VariableAccess _r:
         :return:
         """
+        if self.addr is None:
+            # when address is not available, we assume we are in pseudocode mode and at the top of this function
+            return "down"
         if _r.location.ins_addr < self.addr:
             return "up"
         elif _r.location.ins_addr > self.addr:
@@ -179,15 +191,14 @@ class QXRefVariableModel(QXRefModel):
 
 
 class QXRefAddressModel(QXRefModel):
-
-    HEADER = [('Direction', 70), ('Type', 50), ('PC', 80), ('Text', 300)]
+    HEADER = [("Direction", 70), ("Type", 50), ("PC", 160), ("Text", 300)]
 
     DIRECTION_COL = 0
     TYPE_COL = 1
     PC_COL = 2
     TEXT_COL = 3
 
-    def _get_column_data(self, ref, idx):
+    def _get_column_data(self, ref, idx: int):
         """
 
         :param XRef ref:
@@ -197,16 +208,23 @@ class QXRefAddressModel(QXRefModel):
         mapping = {
             self.DIRECTION_COL: self._direction,
             self.TYPE_COL: self._access_type,
-            self.PC_COL: lambda _r: _r.ins_addr,
+            self.PC_COL: self._addrstr,
             self.TEXT_COL: self._text,
         }
 
-        handler = mapping.get(idx, None)
+        handler = mapping.get(idx)
         if handler is not None:
             return handler(ref)
         return None
 
-    def _direction(self, _r):
+    def _addrstr(self, _r):
+        addr = _r.ins_addr
+        node = self.instance.cfg.get_any_node(addr, anyaddr=True)
+        if node is not None and node.function_address is not None:
+            return f"{addr:#x} ({self.instance.kb.functions[node.function_address].name})"
+        return hex(addr)
+
+    def _direction(self, _r) -> str:
         """
 
         :param XRef _r:
@@ -240,21 +258,29 @@ class QXRefAddressModel(QXRefModel):
 
 
 class QXRefViewer(QTableView):
-
-    def __init__(self, addr=None, variable_manager=None, variable=None, xrefs_manager=None, dst_addr=None,
-                 instance=None, disassembly_view=None, parent=None):
-        super(QXRefViewer, self).__init__(parent)
+    def __init__(
+        self,
+        addr: int | None = None,
+        variable_manager=None,
+        variable=None,
+        xrefs_manager=None,
+        dst_addr=None,
+        instance: Instance = None,
+        xref_dialog=None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
 
         self.verticalHeader().setVisible(False)
-        self.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.setHorizontalScrollMode(self.ScrollPerPixel)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setShowGrid(False)
 
-        self.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self.verticalHeader().setDefaultSectionSize(24)
 
         self._instance = instance
-        self._disassembly_view = disassembly_view
+        self._xref_dialog = xref_dialog
         self._addr = addr
 
         # Two modes
@@ -289,15 +315,15 @@ class QXRefViewer(QTableView):
             self.setColumnWidth(idx, width)
 
         self.setSortingEnabled(True)
-        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
 
         hheader = self.horizontalHeader()
         hheader.setStretchLastSection(True)
-        hheader.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hheader.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
 
         self.doubleClicked.connect(self._on_item_doubleclicked)
 
-    def _reload(self):
+    def _reload(self) -> None:
         if self.mode == XRefMode.Variable:
             self.items = self._variable_manager.get_variable_accesses(self._variable, same_name=True)
             self.items = sorted(self.items, key=lambda item: item.location.ins_addr)
@@ -309,14 +335,13 @@ class QXRefViewer(QTableView):
             self.items = sorted(self.items, key=lambda item: item.ins_addr)
 
     def _xrefs_from_control_flow_transitions(self):
-
-        if self._disassembly_view is not None:
-            cfg = self._disassembly_view.workspace.instance.cfg
+        if self._instance is not None:
+            cfg = self._instance.cfg
             node = cfg.get_any_node(self._dst_addr)
             if node is not None:
                 # its predecessors
                 predecessors = cfg.get_predecessors(node)
-                arch = self._disassembly_view.workspace.instance.project.arch
+                arch = self._instance.project.arch
                 for pred in predecessors:
                     if pred.instruction_addrs:
                         if arch.branch_delay_slot and len(pred.instruction_addrs) > 1:
@@ -325,19 +350,26 @@ class QXRefViewer(QTableView):
                             ins_addr = pred.instruction_addrs[-1]
                     else:
                         ins_addr = pred.addr
-                    yield XRef(ins_addr=ins_addr, block_addr=pred.addr, stmt_idx=None, dst=self._dst_addr,
-                               xref_type=XRefType.Offset,
-                               )
+                    yield XRef(
+                        ins_addr=ins_addr,
+                        block_addr=pred.addr,
+                        stmt_idx=None,
+                        dst=self._dst_addr,
+                        xref_type=XRefType.Offset,
+                    )
 
     #
     # Signal handlers
     #
 
-    def _on_item_doubleclicked(self, model_index):
+    def _on_item_doubleclicked(self, model_index) -> None:
         row = model_index.row()
-        if self._disassembly_view is not None:
-            item = self.items[row]
-            if isinstance(item, VariableAccess):
-                self.parent().jump_to(item.location.ins_addr)
-            elif isinstance(item, XRef):
-                self.parent().jump_to(item.ins_addr)
+        xref_dialog = self._xref_dialog
+        if xref_dialog is None:
+            return
+
+        item = self.items[row]
+        if isinstance(item, VariableAccess):
+            xref_dialog.jump_to(item.location.ins_addr)
+        elif isinstance(item, XRef):
+            xref_dialog.jump_to(item.ins_addr)

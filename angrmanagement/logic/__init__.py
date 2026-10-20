@@ -1,15 +1,28 @@
+from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from PySide6.QtCore import QThread
+
     from angrmanagement.data.library_docs import LibraryDocs
-    from angrmanagement.ui.main_window import MainWindow
+    from angrmanagement.logic.stall_watchdog import StallWatchdog
     from angrmanagement.plugins.plugin_manager import PluginManager
+    from angrmanagement.ui.main_window import MainWindow, QExecuteCodeEventReceiver
+
 
 class GlobalInfo:
-    gui_thread = None
-    main_window: 'MainWindow' = None
+    """
+    Global data.
+    """
+
+    gui_thread: QThread | None = None
+    main_window: MainWindow | None = None
+    event_receiver: QExecuteCodeEventReceiver
     daemon_inst = None
     daemon_conn = None
-    headless_plugin_manager: 'PluginManager' = None
-    library_docs: 'LibraryDocs' = None
+    client_id: str | None = None
+    headless_plugin_manager: PluginManager | None = None
+    library_docs: LibraryDocs = None
     autoreload = False
+    stall_watchdog: StallWatchdog | None = None

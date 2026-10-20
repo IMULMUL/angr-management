@@ -1,16 +1,13 @@
+from __future__ import annotations
 
-import itertools
 from collections import defaultdict
+from typing import TYPE_CHECKING
 
 import networkx
+from angr.codenode import FuncNode
 
-from angr.knowledge_plugins import Function
-
-
-def grouper(iterable, n, fillvalue=None):
-    "Collect data into fixed-length chunks or blocks"
-    args = [iter(iterable)] * n
-    return itertools.izip_longest(*args, fillvalue=fillvalue)
+if TYPE_CHECKING:
+    from angr.knowledge_plugins import Function
 
 
 def to_supergraph(transition_graph):
@@ -28,7 +25,7 @@ def to_supergraph(transition_graph):
 
     # remove all edges that transitions to outside
     for src, dst, data in list(transition_graph.edges(data=True)):
-        if data['type'] in ('transition', 'exception') and data.get('outside', False) is True:
+        if data["type"] in ("transition", "exception") and data.get("outside", False) is True:
             transition_graph.remove_edge(src, dst)
         if transition_graph.in_degree(dst) == 0:
             transition_graph.remove_node(dst)
@@ -51,15 +48,19 @@ def to_supergraph(transition_graph):
                 edges_to_shrink.add((src, dst))
                 continue
 
-        if any(iter('type' in data and data['type'] not in ('fake_return', 'call') for data in edges.values())):
+        if any(iter("type" in data and data["type"] not in ("fake_return", "call") for data in edges.values())):
             continue
 
         for dst, data in edges.items():
-            if isinstance(dst, Function):
+            if isinstance(dst, FuncNode):
                 continue
-            if 'type' in data and data['type'] == 'fake_return':
-                if all(iter('type' in data and data['type'] in ('fake_return', 'return')
-                            for _, _, data in transition_graph.in_edges(dst, data=True))):
+            if "type" in data and data["type"] == "fake_return":
+                if all(
+                    iter(
+                        "type" in data and data["type"] in ("fake_return", "return")
+                        for _, _, data in transition_graph.in_edges(dst, data=True)
+                    )
+                ):
                     edges_to_shrink.add((src, dst))
                 break
 
@@ -71,8 +72,7 @@ def to_supergraph(transition_graph):
     function_nodes = set()  # it will be traversed after all other nodes are added into the supergraph
 
     for node in transition_graph.nodes():
-
-        if isinstance(node, Function):
+        if isinstance(node, FuncNode):
             function_nodes.add(node)
             # don't put functions into the supergraph
             continue
@@ -98,19 +98,14 @@ def to_supergraph(transition_graph):
             existing_out_edges = list(super_graph.out_edges(src_supernode, data=True))
             super_graph.remove_node(src_supernode)
         else:
-            existing_in_edges = [ ]
-            existing_out_edges = [ ]
+            existing_in_edges = []
+            existing_out_edges = []
 
         for dst, data in dests_and_data.items():
-
             edge = (node, dst)
 
             if edge in edges_to_shrink:
-
-                if dst in supernodes_map:
-                    dst_supernode = supernodes_map[dst]
-                else:
-                    dst_supernode = None
+                dst_supernode = supernodes_map.get(dst)
 
                 src_supernode.insert_cfgnode(dst)
 
@@ -132,19 +127,19 @@ def to_supergraph(transition_graph):
                     for src_, _, data_ in super_graph.in_edges(dst_supernode, data=True):
                         super_graph.add_edge(src_, src_supernode, **data_)
 
-                        if 'type' in data_ and data_['type'] in {'transition', 'exception', 'call'}:
-                            if not ('ins_addr' in data_ and 'stmt_idx' in data_):
+                        if "type" in data_ and data_["type"] in {"transition", "exception", "call"}:
+                            if not ("ins_addr" in data_ and "stmt_idx" in data_):
                                 # this is a hack to work around the issue in Function.normalize() where ins_addr and
                                 # stmt_idx weren't properly set onto edges
                                 continue
-                            src_supernode.register_out_branch(data_['ins_addr'], data_['stmt_idx'], data_['type'],
-                                                              dst_supernode.addr
-                                                              )
+                            src_supernode.register_out_branch(
+                                data_["ins_addr"], data_["stmt_idx"], data_["type"], dst_supernode.addr
+                            )
 
                     super_graph.remove_node(dst_supernode)
 
             else:
-                if isinstance(dst, Function):
+                if isinstance(dst, FuncNode):
                     # skip all functions
                     continue
 
@@ -157,14 +152,14 @@ def to_supergraph(transition_graph):
 
                 super_graph.add_edge(src_supernode, dst_supernode, **data)
 
-                if 'type' in data and data['type'] in {'transition', 'exception', 'call'}:
-                    if not ('ins_addr' in data and 'stmt_idx' in data):
+                if "type" in data and data["type"] in {"transition", "exception", "call"}:
+                    if not ("ins_addr" in data and "stmt_idx" in data):
                         # this is a hack to work around the issue in Function.normalize() where ins_addr and
                         # stmt_idx weren't properly set onto edges
                         continue
-                    src_supernode.register_out_branch(data['ins_addr'], data['stmt_idx'], data['type'],
-                                                      dst_supernode.addr
-                                                      )
+                    src_supernode.register_out_branch(
+                        data["ins_addr"], data["stmt_idx"], data["type"], dst_supernode.addr
+                    )
 
         # add back the node (in case there are no edges)
         super_graph.add_node(src_supernode)
@@ -178,30 +173,32 @@ def to_supergraph(transition_graph):
         in_edges = transition_graph.in_edges(node, data=True)
 
         for src, _, data in in_edges:
-            if not ('ins_addr' in data and 'stmt_idx' in data):
+            if not ("ins_addr" in data and "stmt_idx" in data):
                 # this is a hack to work around the issue in Function.normalize() where ins_addr and
                 # stmt_idx weren't properly set onto edges
                 continue
             supernode = supernodes_map[src]
-            supernode.register_out_branch(data['ins_addr'], data['stmt_idx'], data['type'], node.addr)
+            supernode.register_out_branch(data["ins_addr"], data["stmt_idx"], data["type"], node.addr)
 
     return super_graph
 
 
 class OutBranch:
-    def __init__(self, ins_addr, stmt_idx, branch_type):
+    __slots__ = ("ins_addr", "stmt_idx", "type", "targets")
+
+    def __init__(self, ins_addr, stmt_idx, branch_type) -> None:
         self.ins_addr = ins_addr
         self.stmt_idx = stmt_idx
         self.type = branch_type
 
         self.targets = set()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         if self.ins_addr is None:
-            return "<OutBranch at None, type %s>" % self.type
-        return "<OutBranch at %#x, type %s>" % (self.ins_addr, self.type)
+            return f"<OutBranch at None, type {self.type}>"
+        return f"<OutBranch at {self.ins_addr:#x}, type {self.type}>"
 
-    def add_target(self, addr):
+    def add_target(self, addr: int) -> None:
         self.targets.add(addr)
 
     def merge(self, other):
@@ -229,20 +226,25 @@ class OutBranch:
         if not isinstance(other, OutBranch):
             return False
 
-        return self.ins_addr == other.ins_addr and \
-               self.stmt_idx == other.stmt_idx and \
-               self.type == other.type and \
-               self.targets == other.targets
+        return (
+            self.ins_addr == other.ins_addr
+            and self.stmt_idx == other.stmt_idx
+            and self.type == other.type
+            and self.targets == other.targets
+        )
 
     def __hash__(self):
         return hash((self.ins_addr, self.stmt_idx, self.type))
 
 
 class SuperCFGNode:
-    def __init__(self, addr):
-        self.addr = addr
+    __slots__ = ("addr", "idx", "cfg_nodes", "out_branches")
 
-        self.cfg_nodes = [ ]
+    def __init__(self, addr: int, idx: int | None = None) -> None:
+        self.addr = addr
+        self.idx = idx
+
+        self.cfg_nodes = []
 
         self.out_branches = defaultdict(dict)
 
@@ -258,7 +260,7 @@ class SuperCFGNode:
 
         return s
 
-    def insert_cfgnode(self, cfg_node):
+    def insert_cfgnode(self, cfg_node) -> None:
         # TODO: Make it binary search/insertion
         for i, n in enumerate(self.cfg_nodes):
             if cfg_node.addr < n.addr:
@@ -273,13 +275,13 @@ class SuperCFGNode:
         # update addr
         self.addr = self.cfg_nodes[0].addr
 
-    def register_out_branch(self, ins_addr, stmt_idx, branch_type, target_addr):
+    def register_out_branch(self, ins_addr, stmt_idx, branch_type, target_addr) -> None:
         if ins_addr not in self.out_branches or stmt_idx not in self.out_branches[ins_addr]:
             self.out_branches[ins_addr][stmt_idx] = OutBranch(ins_addr, stmt_idx, branch_type)
 
         self.out_branches[ins_addr][stmt_idx].add_target(target_addr)
 
-    def merge(self, other):
+    def merge(self, other) -> None:
         """
         Merge another supernode into the current one.
 
@@ -302,16 +304,33 @@ class SuperCFGNode:
                 item = next(iter(outs.values()))
                 self.out_branches[ins_addr][item.stmt_idx] = item
 
-    def __repr__(self):
-        return "<SuperCFGNode %#08x, %d blocks, %d out branches>" % (self.addr, len(self.cfg_nodes),
-                                                                     len(self.out_branches)
-                                                                     )
+    def __repr__(self) -> str:
+        return f"<SuperCFGNode {self.addr:#08x}, {len(self.cfg_nodes)} blocks, {len(self.out_branches)} out branches>"
 
     def __hash__(self):
-        return hash(('supercfgnode', self.addr))
+        return hash(("supercfgnode", self.addr))
 
     def __eq__(self, other):
         if not isinstance(other, SuperCFGNode):
             return False
 
         return self.addr == other.addr
+
+
+def get_out_branches(func: Function, obj_addr: int) -> dict[int, dict[int, OutBranch]]:
+    func_graph = func.transition_graph
+    func_block = func.get_node(obj_addr)
+    if func_block is None:
+        return {}
+    out_branches = {}
+    for _, dst, data in func_graph.out_edges(func_block, data=True):
+        if "ins_addr" in data and "stmt_idx" in data and "type" in data:
+            ins_addr = data["ins_addr"]
+            stmt_idx = data["stmt_idx"]
+            branch_type = data["type"]
+            if branch_type in {"transition", "exception", "call"}:
+                if ins_addr not in out_branches:
+                    out_branches[ins_addr] = {}
+                out_branches[ins_addr][stmt_idx] = OutBranch(ins_addr, stmt_idx, branch_type)
+                out_branches[ins_addr][stmt_idx].add_target(dst.addr)
+    return out_branches

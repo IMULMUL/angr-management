@@ -1,28 +1,44 @@
-from PySide2.QtWidgets import QDialog, QVBoxLayout, QLabel, QGridLayout, QRadioButton, QGroupBox, QScrollArea, \
-    QWidget, QDialogButtonBox
-from PySide2.QtGui import QTextOption
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from pyqodeng.core.api import CodeEdit
-from pyqodeng.core.modes import CaretLineHighlighterMode, PygmentsSyntaxHighlighter, AutoIndentMode
-from ...data.instance import Instance
+from pyqodeng.core.modes import AutoIndentMode, CaretLineHighlighterMode, PygmentsSyntaxHighlighter
+from PySide6.QtGui import QTextOption
+from PySide6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QGridLayout,
+    QGroupBox,
+    QLabel,
+    QRadioButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
+
+if TYPE_CHECKING:
+    from angrmanagement.ui.workspace import Workspace
 
 
 class HookDialog(QDialog):
     """
     Provide templetes of hook function.
     """
-    def __init__(self, instance: Instance, addr=None, parent=None):
+
+    def __init__(self, workspace: Workspace, addr: int | None = None, parent=None) -> None:
         super().__init__(parent)
 
         # initialization
 
-        self.instance = instance
+        self.workspace = workspace
         self.state = None  # output
         self._addr = addr
         self.templates = {}
         self._add_templates(hex(addr))
         self._function_box = None
         self._ok_button = None
-        self.setWindowTitle('Change hook')
+        self.setWindowTitle("Change hook")
         self.main_layout = QVBoxLayout()
         self._init_widgets()
         self.setLayout(self.main_layout)
@@ -31,20 +47,20 @@ class HookDialog(QDialog):
     # Private methods
     #
 
-    def _add_templates(self, addr):
-        self.templates['base'] = f"""\
+    def _add_templates(self, addr: int) -> None:
+        self.templates["base"] = f"""\
 @project.hook(addr={addr}, length=0)
 def hook(state):
     ..."""
 
-        self.templates['assertion'] = f"""\
+        self.templates["assertion"] = f"""\
 @project.hook(addr={addr}, length=0)
 def assertion(state):
     state.add_constraints(
         ...
     )"""
 
-        self.templates['disable unicorn'] = f"""\
+        self.templates["disable unicorn"] = f"""\
 @project.hook(addr={addr}, length=0)
 def disable_unicorn(state):
     state.options.discard("UNICORN")
@@ -54,7 +70,7 @@ def disable_unicorn(state):
     state.options.discard("UNICORN_TRACK_STACK_POINTERS")
 """
 
-        self.templates['enable unicorn'] = f"""\
+        self.templates["enable unicorn"] = f"""\
 @project.hook(addr={addr}, length=0)
 def enable_unicorn(state):
     state.options.add("UNICORN")
@@ -64,15 +80,15 @@ def enable_unicorn(state):
     state.options.add("UNICORN_TRACK_STACK_POINTERS")
 """
 
-    def update_function(self, template):
-        self._function_box.setPlainText(template, mime_type="text/x-python",encoding="utf-8")
+    def update_function(self, template) -> None:
+        self._function_box.setPlainText(template, mime_type="text/x-python", encoding="utf-8")
 
-    def selected(self):
+    def selected(self) -> None:
         btn = self.sender()
         if btn.isChecked():
             self.update_function(btn.template)
 
-    def _init_widgets(self):
+    def _init_widgets(self) -> None:
         layout = QGridLayout()
         row = 0
 
@@ -117,7 +133,7 @@ def enable_unicorn(state):
         function_box.modes.append(PygmentsSyntaxHighlighter(function_box.document()))
         function_box.modes.append(AutoIndentMode())
 
-        function_box.setWordWrapMode(QTextOption.WordWrap)
+        function_box.setWordWrapMode(QTextOption.WrapMode.WordWrap)
         self._function_box = function_box
 
         layout.addWidget(function_box, row, 0)
@@ -127,11 +143,13 @@ def enable_unicorn(state):
 
         buttons = QDialogButtonBox(parent=self)
         buttons.setStandardButtons(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
-        buttons.button(QDialogButtonBox.Ok).setText('Append to Console')
-        def do_ok():
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Append to Console")
+
+        def do_ok() -> None:
             code = function_box.toPlainText()
-            self.instance.append_code_to_console(code)
+            self.workspace.append_code_to_console(code)
             self.close()
+
         buttons.accepted.connect(do_ok)
         buttons.rejected.connect(self.close)
         self.main_layout.addWidget(buttons)

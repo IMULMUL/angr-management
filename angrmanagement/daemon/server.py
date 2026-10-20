@@ -1,21 +1,21 @@
 # pylint:disable=import-outside-toplevel,unused-argument
-import time
-import sys
+from __future__ import annotations
+
 import subprocess
+import sys
 import threading
-from typing import Callable
+import time
 
 import rpyc
 from rpyc.utils.server import ThreadedServer
 
-from ..logic.singleton import SingleInstance, SingleInstanceException
-from ..utils.env import app_path
-
+from angrmanagement.logic.singleton import SingleInstance, SingleInstanceException
+from angrmanagement.utils.env import app_path
 
 DEFAULT_PORT = 64000
 
-CONNECTIONS = { }
-TargetIDtoCONN = { }
+CONNECTIONS = {}
+TargetIDtoCONN = {}
 
 
 class ManagementService(rpyc.Service):
@@ -32,58 +32,64 @@ class ManagementService(rpyc.Service):
             conn = TargetIDtoCONN[target_id]
         else:
             raise Exception(
-                "The specified target %s is not open in angr management. We have the following ones: %s." % (
-                target_id,
-                str(TargetIDtoCONN)))
+                f"The specified target {target_id} is not open in angr management. "
+                f"We have the following ones: {str(TargetIDtoCONN)}."
+            )
         return conn
 
-    def on_connect(self, conn):
+    def on_connect(self, conn) -> None:
         self._conn = conn
         CONNECTIONS[conn] = None
 
-    def on_disconnect(self, conn):
+    def on_disconnect(self, conn) -> None:
         self._conn = None
-        if conn in CONNECTIONS:
-            del CONNECTIONS[conn]
+        CONNECTIONS.pop(conn, None)
+        stale_targets = [target_id for target_id, target_conn in TargetIDtoCONN.items() if target_conn is conn]
+        for target_id in stale_targets:
+            del TargetIDtoCONN[target_id]
 
-    def exposed_open(self, bin_path):
+    def exposed_open(self, bin_path) -> None:
         if bin_path is None:
             return
 
-        flags = { }
+        flags = {}
         if sys.platform.startswith("win"):
             DETACHED_PROCESS = 0x00000008
-            flags['creationflags'] = DETACHED_PROCESS
+            flags["creationflags"] = DETACHED_PROCESS
 
         apppath = app_path(pythonw=False, as_list=True)
         shell = sys.platform.startswith("win")
         # default to using daemon
         # if the user chooses to use angr URL scheme to load a binary, they are more likely to keep interacting with
         # this binary using angr URL scheme, which requires the angr management instance to run in with-daemon mode.
-        subprocess.Popen(apppath + ["-d", bin_path], shell=shell, stdin=None, stdout=None,
-                                stderr=None,
-                                close_fds=True, **flags)
+        subprocess.Popen(
+            apppath + ["-d", bin_path], shell=shell, stdin=None, stdout=None, stderr=None, close_fds=True, **flags
+        )
 
-    def exposed_jumpto(self, addr, symbol, target_id: str):
+    def exposed_jumpto(self, addr: int, symbol, target_id: str) -> None:
         conn = self._get_conn(target_id)
         conn.root.jumpto(addr, symbol)
 
-    def exposed_register_binary(self, bin_path, target_id: str):
+    def exposed_register_client(self, target_id: str) -> None:
         TargetIDtoCONN[target_id] = self._conn
 
-    def exposed_commentat(self, addr, comment, target_id: str):
+    def exposed_commentat(self, addr: int, comment: str, target_id: str) -> None:
         conn = self._get_conn(target_id)
         conn.root.commentat(addr, comment)
 
-    def exposed_exit(self):
+    def exposed_select_insns(self, addrs: list[int] | None, target_id: str):
+        conn = self._get_conn(target_id)
+        conn.root.select_insns(addrs)
+
+    def exposed_exit(self) -> None:
         pass
 
-    def exposed_custom_binary_aware_action(self, target_id: str, action, kwargs):
+    def exposed_custom_binary_aware_action(self, target_id: str, action, kwargs) -> None:
         conn = self._get_conn(target_id)
         conn.root.custom_binary_aware_action(action, kwargs)
 
 
-def monitor_thread(server):
+def monitor_thread(server) -> None:
     """
     Monitors connection status, and kills the server (which is, the daemon process) after the last active connection is
     gone for 5 minutes.
@@ -111,26 +117,27 @@ def monitor_thread(server):
         time.sleep(1)
 
 
-def start_daemon(port=DEFAULT_PORT):
-
+def start_daemon(port: int = DEFAULT_PORT) -> None:
     try:
-        from ..logic import GlobalInfo
+        from angrmanagement.logic import GlobalInfo
+
         GlobalInfo.daemon_inst = SingleInstance()
     except SingleInstanceException:
         return
 
     # load plugins in headless mode
-    from ..plugins import PluginManager
+    from angrmanagement.plugins import PluginManager
+
     GlobalInfo.headless_plugin_manager = PluginManager(None)
     GlobalInfo.headless_plugin_manager.discover_and_initialize_plugins()
 
     # start the server
-    server = ThreadedServer(ManagementService, port=port, protocol_config={'allow_public_attrs': True})
-    threading.Thread(target=monitor_thread, args=(server, ), daemon=True).start()
+    server = ThreadedServer(ManagementService, port=port, protocol_config={"allow_public_attrs": True})
+    threading.Thread(target=monitor_thread, args=(server,), daemon=True).start()
     server.start()
 
 
-def daemon_exists():
+def daemon_exists() -> bool:
     try:
         inst = SingleInstance()
     except SingleInstanceException:
@@ -139,31 +146,21 @@ def daemon_exists():
     return False
 
 
-def run_daemon_process():
+def run_daemon_process() -> None:
     """
     Start a new Python process to run daemon.
 
     :return:
     """
 
-    flags = { }
+    flags = {}
     if sys.platform.startswith("win"):
         DETACHED_PROCESS = 0x00000008
-        flags['creationflags'] = DETACHED_PROCESS
+        flags["creationflags"] = DETACHED_PROCESS
 
     apppath = app_path(pythonw=True, as_list=True)
-    proc = subprocess.Popen(apppath + ["-D"], stdin=None, stdout=None, stderr=None,
-                            close_fds=True, **flags)
+    subprocess.Popen(apppath + ["-D"], stdin=None, stdout=None, stderr=None, close_fds=True, **flags)
 
 
-def daemon_conn(port=DEFAULT_PORT, service=None):
-    kwargs = { }
-    if service is not None:
-        kwargs['service'] = service
-    kwargs['config'] = {'allow_public_attrs': True}
-    conn = rpyc.connect("localhost", port, **kwargs)
-    return conn
-
-
-def register_server_exposed_method(method_name: str, method: Callable):
-    setattr(ManagementService, f"exposed_{method_name}", method)
+def daemon_conn(port: int = DEFAULT_PORT, service=rpyc.VoidService):
+    return rpyc.connect("localhost", port, service=service, config={"allow_public_attrs": True})

@@ -1,5 +1,7 @@
-from PySide2.QtGui import Qt
-from PySide2.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPlainTextEdit, QDialogButtonBox
+from __future__ import annotations
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QPlainTextEdit, QVBoxLayout
 
 
 class AsmOutput(QDialog):
@@ -7,14 +9,14 @@ class AsmOutput(QDialog):
     Displays generated assembly code
     """
 
-    def __init__(self, s: str, parent=None):
+    def __init__(self, s: str, parent=None) -> None:
         super().__init__(parent)
 
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
 
         self._edit: QPlainTextEdit = None
 
-        self.setWindowTitle('Assembly code output')
+        self.setWindowTitle("Assembly code output")
 
         self.main_layout = QVBoxLayout()
 
@@ -30,12 +32,11 @@ class AsmOutput(QDialog):
     # Private methods
     #
 
-    def _init_widgets(self):
-
+    def _init_widgets(self) -> None:
         # Assembly label
 
         asm_label = QLabel(self)
-        asm_label.setText('Assembly code')
+        asm_label.setText("Assembly code")
 
         edit = QPlainTextEdit()
         edit.setMinimumWidth(600)

@@ -1,43 +1,48 @@
-from typing import List, Optional, Tuple
-import math
+from __future__ import annotations
 
-from PySide2.QtCore import Qt, QRectF
-from PySide2.QtWidgets import QGraphicsSimpleTextItem
+from typing import TYPE_CHECKING
 
-from angr.knowledge_plugins.cfg.memory_data import MemoryDataSort, MemoryData
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtWidgets import QGraphicsSimpleTextItem
 
-from ...utils import get_label_text, is_printable
-from ...config import Conf
+from angrmanagement.config import Conf
+from angrmanagement.utils import get_label_text, is_printable
+
 from .qgraph_object import QCachedGraphicsItem
+
+if TYPE_CHECKING:
+    from angr.knowledge_plugins.cfg.memory_data import MemoryData
+
+    from angrmanagement.data.instance import Instance
 
 
 class QMemoryDataBlock(QCachedGraphicsItem):
-
     ADDRESS_LABEL_OFFSET = 20
     LINEAR_INSTRUCTION_OFFSET = 120
     BYTE_AREA_SPACING = 15
 
-    def __init__(self, workspace, infodock, addr, memory_data, bytes_per_line=16, parent=None):
+    def __init__(
+        self, instance: Instance, infodock, addr: int, memory_data, bytes_per_line: int = 16, parent=None
+    ) -> None:
         super().__init__(parent=parent)
-        self.workspace = workspace
+        self.instance = instance
         self.infodock = infodock
         self.addr = addr
         self.memory_data: MemoryData = memory_data
         self.bytes_per_line: int = bytes_per_line  # TODO: Move it to Conf
 
         self._addr_text = None
-        self._width = None
-        self._height = None
+        self._width: float = 0.0
+        self._height: float = 0.0
 
-        self._bytes = [ ]
+        self._bytes = []
 
         # widgets
-        self._addr_item: QGraphicsSimpleTextItem = None
-        self._label_item: Optional[QGraphicsSimpleTextItem] = None
-        self._line_items: List[Tuple[int,
-                                     QGraphicsSimpleTextItem,
-                                     List[QGraphicsSimpleTextItem],
-                                     List[QGraphicsSimpleTextItem]]] = None
+        self._addr_item: QGraphicsSimpleTextItem | None = None
+        self._label_item: QGraphicsSimpleTextItem | None = None
+        self._line_items: list[
+            tuple[int, QGraphicsSimpleTextItem, list[QGraphicsSimpleTextItem], list[QGraphicsSimpleTextItem]]
+        ] = []
 
         self._init_widgets()
 
@@ -53,8 +58,7 @@ class QMemoryDataBlock(QCachedGraphicsItem):
     def height(self):
         return self.boundingRect().height()
 
-    def paint(self, painter, option, widget):
-
+    def paint(self, painter, option, widget=None) -> None:
         should_highlight = self.infodock.is_label_selected(self.addr)
 
         highlight_color = Conf.disasm_view_label_highlight_color
@@ -63,38 +67,71 @@ class QMemoryDataBlock(QCachedGraphicsItem):
             painter.setPen(highlight_color)
             painter.drawRect(0, 0, self.width, self.height)
 
+    def remove_children_from_scene(self):
+        """
+        Remove this item and all its children from the scene.
+        """
+        scene = self.scene()
+        if scene is None:
+            return
+
+        if self._addr_item is not None:
+            scene.removeItem(self._addr_item)
+            self._addr_item = None
+
+        if self._label_item is not None:
+            scene.removeItem(self._label_item)
+            self._label_item = None
+
+        if self._line_items:
+            for _, addr_item, bytes_line, characters_line in self._line_items:
+                for byte_item in bytes_line:
+                    scene.removeItem(byte_item)
+                for char_item in characters_line:
+                    scene.removeItem(char_item)
+                scene.removeItem(addr_item)
+            self._line_items = []
+
     #
     # Event handlers
     #
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
             # unselect all other labels
             self.infodock.unselect_all_labels()
             # select this label
             self.infodock.select_label(self.addr)
+        elif event.button() == Qt.MouseButton.RightButton:
+            # unselect all other labels
+            self.infodock.unselect_all_labels()
+            # select this label
+            self.infodock.select_label(self.addr)
+            # show context menu
+            self.infodock.disasm_view.label_context_menu(self.addr, event.screenPos())
 
     #
     # Private methods
     #
 
-    def _init_widgets(self):
-
-        self._addr_text = "%08x" % self.addr
-        self._bytes = [ ]
+    def _init_widgets(self) -> None:
+        self._addr_text = f"{self.addr:08x}"
+        self._bytes = []
         if self.memory_data.content:
-            for byt in self.memory_data.content:
-                self._bytes.append(byt)
+            cnt = self.memory_data.content
+            if self.memory_data.size is not None:
+                cnt = cnt[: self.memory_data.size]
+            self._bytes += list(cnt)
 
-        if len(self._bytes) < self.memory_data.size:
+        if self.memory_data.size is not None and len(self._bytes) < self.memory_data.size:
             # load more from mapped memory
             start_address = self.memory_data.addr + len(self._bytes)
             size = self.memory_data.size - len(self._bytes)
             try:
-                mem_bytes = self.workspace.instance.project.loader.memory.load(start_address, size)
+                mem_bytes = self.instance.project.loader.memory.load(start_address, size)
             except KeyError:
                 mem_bytes = b""
-            self._bytes += [ b for b in mem_bytes ] + [ '??' ] * (size - len(mem_bytes))
+            self._bytes += list(mem_bytes) + ["??"] * (size - len(mem_bytes))
 
         # address
         self._addr_item = QGraphicsSimpleTextItem(self._addr_text, self)
@@ -109,39 +146,37 @@ class QMemoryDataBlock(QCachedGraphicsItem):
 
         self._layout_items_and_update_size()
 
-    def _init_label_item(self):
-        lbl_text = get_label_text(self.addr, self.workspace.instance.kb)
+    def _init_label_item(self) -> None:
+        lbl_text = get_label_text(self.addr, self.instance.kb)
         if lbl_text:
             self._label_item = QGraphicsSimpleTextItem(lbl_text, self)
             self._label_item.setFont(Conf.code_font)
             self._label_item.setBrush(Conf.disasm_view_label_color)
         else:
-            if self._label_item is not None:
-                self._label_item.setParentItem(None)
+            if self._label_item is not None and (scene := self.scene()) is not None:
+                scene.removeItem(self._label_item)
                 self._label_item = None
 
-    def _init_bytes(self):
-
-        if self._line_items:
+    def _init_bytes(self) -> None:
+        if self._line_items and (scene := self.scene()) is not None:
             # remove existing items
-            for line in self._line_items:
-                for item in line:
-                    item.setParentItem(None)
-            self._line_items = None
+            for _, addr_item, bytes_list, character_list in self._line_items:
+                scene.removeItem(addr_item)
+                for item in bytes_list:
+                    scene.removeItem(item)
+                for line in character_list:
+                    scene.removeItem(line)
+            self._line_items = []
 
         addr = self.addr
         i = 0
         self._line_items = []
 
         while i < len(self._bytes):
-
             byte_offset = addr % self.bytes_per_line
-            if byte_offset == 0:
-                end_pos = i + self.bytes_per_line
-            else:
-                end_pos = self.bytes_per_line - byte_offset
+            end_pos = i + self.bytes_per_line if byte_offset == 0 else self.bytes_per_line - byte_offset
 
-            all_bytes = self._bytes[i : end_pos]
+            all_bytes = self._bytes[i:end_pos]
             # print("... print %#x, %d bytes, byte_offset %d" % (addr, len(all_bytes), byte_offset))
             addr_item, bytes_list, character_list = self._init_line(addr, byte_offset, all_bytes)
             self._line_items.append((byte_offset, addr_item, bytes_list, character_list))
@@ -149,8 +184,7 @@ class QMemoryDataBlock(QCachedGraphicsItem):
             addr += end_pos - i
             i = end_pos
 
-    def _init_line(self, addr, byte_offset, all_bytes):
-
+    def _init_line(self, addr: int, byte_offset, all_bytes):
         # colors
         printable_byte_color = Conf.disasm_view_printable_byte_color
         printable_char_color = Conf.disasm_view_printable_character_color
@@ -160,20 +194,17 @@ class QMemoryDataBlock(QCachedGraphicsItem):
         unknown_char_color = Conf.disasm_view_unknown_character_color
 
         # address
-        addr_text = "%08x" % addr
+        addr_text = f"{addr:08x}"
         addr_item = QGraphicsSimpleTextItem(addr_text, self)
         addr_item.setBrush(Conf.disasm_view_node_address_color)
         addr_item.setFont(Conf.disasm_font)
 
         # draw each byte
-        bytes_list = [ ]
+        bytes_list = []
         for idx, byt in enumerate(all_bytes):
-            if type(byt) is int:
-                if is_printable(byt):
-                    color = printable_byte_color
-                else:
-                    color = unprintable_byte_color
-                o = QGraphicsSimpleTextItem("%02x" % byt, self)
+            if isinstance(byt, int):
+                color = printable_byte_color if is_printable(byt) else unprintable_byte_color
+                o = QGraphicsSimpleTextItem(f"{byt:02x}", self)
                 o.setFont(Conf.disasm_font)
                 o.setBrush(color)
             else:  # str, usually because it is an unknown byte, in which case the str is "??"
@@ -186,14 +217,14 @@ class QMemoryDataBlock(QCachedGraphicsItem):
             if line_chars % 8 == 0 and line_chars != self.bytes_per_line:
                 # print a deliminator
                 o = QGraphicsSimpleTextItem("-", self)
-                o.setBrush(Qt.black)
+                o.setBrush(Qt.GlobalColor.black)
                 o.setFont(Conf.disasm_font)
                 bytes_list.append(o)
 
         # printable characters
-        character_list = [ ]
+        character_list = []
         for byt in all_bytes:
-            if type(byt) is int:
+            if isinstance(byt, int):
                 if is_printable(byt):
                     color = printable_char_color
                     ch = chr(byt)
@@ -210,9 +241,10 @@ class QMemoryDataBlock(QCachedGraphicsItem):
 
         return addr_item, bytes_list, character_list
 
-    def _layout_items_and_update_size(self):
-
+    def _layout_items_and_update_size(self) -> None:
         x, y = 0, 0
+
+        assert self._addr_item is not None
 
         #
         # first line
@@ -251,7 +283,9 @@ class QMemoryDataBlock(QCachedGraphicsItem):
                 byte_.setPos(x, y)
                 x += byte_width
 
-                line_chars = byte_offset + all_bytes + 1  # the number of existing characters on this line, including spaces
+                line_chars = (
+                    byte_offset + all_bytes + 1
+                )  # the number of existing characters on this line, including spaces
                 if line_chars % 8 == 0 and line_chars != self.bytes_per_line:
                     # now we get a delimiter
                     pos += 1

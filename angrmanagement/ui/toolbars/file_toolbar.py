@@ -1,27 +1,30 @@
+from __future__ import annotations
 
-import os
+from typing import TYPE_CHECKING
 
-from PySide2.QtGui import QIcon
+from angrmanagement.ui.icons import icon
 
-from ...config import IMG_LOCATION
 from .toolbar import Toolbar, ToolbarAction
+
+if TYPE_CHECKING:
+    from angrmanagement.ui.main_window import MainWindow
 
 
 class FileToolbar(Toolbar):
-    def __init__(self, main_window):
-        super(FileToolbar, self).__init__(main_window, 'File')
+    def __init__(self, main_window: MainWindow) -> None:
+        super().__init__(main_window, "File")
 
         self.actions = [
-            ToolbarAction(QIcon(os.path.join(IMG_LOCATION, 'toolbar-file-open.ico')),
-                          "Open File", "Open a new file for analysis",
-                          main_window.open_file_button,
-                          ),
-            ToolbarAction(QIcon(os.path.join(IMG_LOCATION, 'toolbar-docker-open.png')),
-                          "Open Docker Target", "Open a file located within a docker image for analysis",
-                          main_window.open_docker_button,
-                          ),
-            ToolbarAction(QIcon(os.path.join(IMG_LOCATION, 'toolbar-file-save.png')),
-                          "Save", "Save angr database",
-                          main_window.save_database,
-                          ),
+            ToolbarAction(
+                icon("file-open"),
+                "Open File",
+                "Open a new file for analysis",
+                main_window.open_file_button,
+            ),
+            ToolbarAction(
+                icon("file-save"),
+                "Save",
+                "Save angr database",
+                main_window.save_database,
+            ),
         ]

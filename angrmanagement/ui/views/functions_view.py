@@ -1,28 +1,36 @@
-from PySide2.QtWidgets import QVBoxLayout, QLabel
-from PySide2.QtCore import QSize
+from __future__ import annotations
 
-from .view import BaseView
-from ..widgets.qfunction_table import QFunctionTable
+from typing import TYPE_CHECKING
+
+from PySide6.QtWidgets import QVBoxLayout
+
+from angrmanagement.ui.widgets.qfunction_table import QFunctionTable
+
+from .view import InstanceView
+
+if TYPE_CHECKING:
+    from angrmanagement.data.instance import Instance
+    from angrmanagement.ui.workspace import Workspace
 
 
-class FunctionsView(BaseView):
-    def __init__(self, workspace, default_docking_position, *args, **kwargs):
-        super(FunctionsView, self).__init__('functions', workspace, default_docking_position, *args, **kwargs)
+class FunctionsView(InstanceView):
+    """
+    View displaying functions in the project.
+    """
 
-        self.base_caption = 'Functions'
-        self._function_table = None  # type: QFunctionTable
-        self._status_label = None
+    def __init__(self, workspace: Workspace, default_docking_position: str, instance: Instance) -> None:
+        super().__init__("functions", workspace, default_docking_position, instance)
 
-        self.workspace.instance.cfg.am_subscribe(self.reload)
+        self.base_caption = "Functions"
+        self._function_table: QFunctionTable
+
+        self.instance.cfg.am_subscribe(self.reload)
 
         self._init_widgets()
 
-        self.width_hint = 100
+        self.width_hint = 375
         self.height_hint = 0
         self.updateGeometry()
-
-        self.function_count = None
-        self._displayed_function_count = None
 
         self.reload()
 
@@ -30,25 +38,23 @@ class FunctionsView(BaseView):
     # Public methods
     #
 
-    def refresh(self):
+    def reset_cache_and_refresh(self) -> None:
+        # XXX: yes this is bad, however, the cache is not being updated properly and is documented
+        # in https://github.com/angr/angr-management/pull/1023. Until that is fixed, this is what we got.
+        self._function_table._table_view._model._data_cache = {}
+        self.refresh()
+
+    def refresh(self) -> None:
         self._function_table.refresh()
 
-    def set_function_count(self, count):
-        self.function_count = count
-        self._refresh_status_label()
+    def reload(self) -> None:
+        if not self.instance.cfg.am_none:
+            self._function_table.function_manager = self.instance.kb.functions
+        else:
+            # the project was closed (or no CFG yet): clear the table
+            self._function_table.function_manager = None
 
-    def set_displayed_function_count(self, count):
-        self._displayed_function_count = count
-        self._refresh_status_label()
-
-    def reload(self):
-        if not self.workspace.instance.cfg.am_none:
-            self._function_table.function_manager = self.workspace.instance.kb.functions
-
-    def minimumSizeHint(self, *args, **kwargs):
-        return QSize(100, 500)
-
-    def subscribe_func_select(self, callback):
+    def subscribe_func_select(self, callback) -> None:
         """
         Appends the provided function to the list of callbacks to be called when a function is selected in the
         functions table. The callback's only parameter is the `angr.knowledge_plugins.functions.function.Function`
@@ -60,17 +66,17 @@ class FunctionsView(BaseView):
     # Private methods
     #
 
-    def _init_widgets(self):
-        self._function_table = QFunctionTable(self, self.workspace, selection_callback=self._on_function_selected)
-        self._status_label = QLabel()
+    def _init_widgets(self) -> None:
+        self._function_table = QFunctionTable(self, self.instance, selection_callback=self._on_function_selected)
 
         vlayout = QVBoxLayout()
         vlayout.addWidget(self._function_table)
-        vlayout.addWidget(self._status_label)
+        vlayout.setSpacing(0)
+        vlayout.setContentsMargins(0, 0, 0, 0)
 
         self.setLayout(vlayout)
 
-    def _on_function_selected(self, func):
+    def _on_function_selected(self, func) -> None:
         """
         A new function is on selection right now. Update the disassembly view that is currently at front.
 
@@ -78,11 +84,3 @@ class FunctionsView(BaseView):
         :return:
         """
         self.workspace.on_function_selected(func=func)
-
-    def _refresh_status_label(self):
-        if self._status_label is not None:
-            function_count = 0 if self.function_count is None else self.function_count
-            if self._displayed_function_count is not None:
-                self._status_label.setText("%d/%d functions" % (self._displayed_function_count, function_count))
-            else:
-                self._status_label.setText("%d functions" % function_count)

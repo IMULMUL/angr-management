@@ -1,26 +1,27 @@
+from __future__ import annotations
+
 import logging
 
-from PySide2.QtWidgets import QGraphicsItem
-from PySide2.QtGui import QColor, QPen
-from PySide2.QtCore import Qt, QRectF
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QColor, QPen
+from PySide6.QtWidgets import QGraphicsItem
 
-from ...config import Conf
-from ...utils import locate_function
+from angrmanagement.config import Conf
+from angrmanagement.utils import locate_function
 
 _l = logging.getLogger(__name__)
 
 
 class QStateBlock(QGraphicsItem):
-
     HORIZONTAL_PADDING = 5
     VERTICAL_PADDING = 5
     LINE_MARGIN = 3
 
-    def __init__(self, is_selected, symexec_view, state=None, history=None):
-        super(QStateBlock, self).__init__()
+    def __init__(self, is_selected: bool, symexec_view, state=None, history=None) -> None:
+        super().__init__()
 
         self.symexec_view = symexec_view
-        self._workspace = self.symexec_view.workspace
+        self._instance = self.symexec_view.instance
         self._config = Conf
 
         self.state = state
@@ -48,62 +49,70 @@ class QStateBlock(QGraphicsItem):
         else:
             return None
 
-    def _init_widgets(self):
-
+    def _init_widgets(self) -> None:
         addr = None
-        if self.state.regs._ip.symbolic:
-            self._label_str = str(self.state.regs._ip)
-        else:
-            addr = self.state.regs._ip._model_concrete.value
-            self._label_str = "%#x" % addr
-        self._label_str = "State " + self._label_str
+        try:
+            if self.state.regs._ip.symbolic:
+                self._label_str = str(self.state.regs._ip)
+            else:
+                addr = self.state.regs._ip.concrete_value
+                self._label_str = f"{addr:#x}"
+        except ReferenceError:
+            # The SimState was held via weakref and has been garbage-collected
+            # while the path-tree view was still alive (issue #1644). Fall back
+            # to a placeholder label instead of letting the graphical update
+            # abort halfway through.
+            self._label_str = "<state freed>"
+            self._function_str = "Function: Unknown"
+            self.addr = None
+            return
 
         self.addr = addr
 
         if addr is None:
             self._function_str = "Unknown"
         else:
-            the_func = locate_function(self._workspace.instance, addr)
+            the_func = locate_function(self._instance, addr)
             if the_func is None:
                 # is it a SimProcedure?
-                if self._workspace.instance.project.is_hooked(addr):
-                    hooker = self._workspace.instance.project.hooked_by(addr)
-                    self._function_str = "SimProcedure " + hooker.__class__.__name__.split('.')[-1]
+                if self._instance.project.is_hooked(addr):
+                    hooker = self._instance.project.hooked_by(addr)
+                    self._function_str = "SimProcedure " + hooker.__class__.__name__.split(".")[-1]
                 else:
                     self._function_str = "Unknown"
             else:
                 offset = addr - the_func.addr
                 if not the_func.name:
-                    self._function_str = "%#x%+x" % (the_func.addr, offset)
+                    self._function_str = f"{the_func.addr:#x}{offset:+x}"
                 else:
-                    self._function_str = "%s%+x" % (the_func.name, offset)
-        self._function_str = "Function: %s" % self._function_str
+                    self._function_str = f"{the_func.name}{offset:+x}"
+        self._function_str = f"Function: {self._function_str}"
 
-    def mousePressEvent(self, event): #pylint: disable=no-self-use
+    def mousePressEvent(self, event) -> None:  # pylint: disable=no-self-use
         super().mousePressEvent(event)
 
-    def mouseReleaseEvent(self, event):
+    def mouseReleaseEvent(self, event) -> None:
         # _l.debug('QStateBlock received mouse release event')
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             self.selected = not self.selected
             self.symexec_view.redraw_graph()
             event.accept()
 
         super().mouseReleaseEvent(event)
 
-    def mouseDoubleClickEvent(self, event):
+    def mouseDoubleClickEvent(self, event) -> None:
         # _l.debug('QStateBlock received mouse double click event')
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             if self.state is not None:
-                self._workspace.viz(self.state.addr)
+                self.symexec_view.workspace.viz(self.state.addr)
                 event.accept()
             elif self.history is not None:
-                self._workspace.viz(self.history.state.addr)
+                self.symexec_view_instance.workspace.viz(self.history.state.addr)
                 event.accept()
 
         super().mouseDoubleClickEvent(event)
 
-    def paint(self, painter, option, widget): #pylint: disable=unused-argument
+    def paint(self, painter, option, widget) -> None:  # pylint: disable=unused-argument
         """
         Paint a state block on the scene.
 
@@ -112,15 +121,15 @@ class QStateBlock(QGraphicsItem):
         """
 
         painter.setFont(Conf.symexec_font)
-        normal_background = QColor(0xfa, 0xfa, 0xfa)
-        selected_background = QColor(0xcc, 0xcc, 0xcc)
+        normal_background = QColor(0xFA, 0xFA, 0xFA)
+        selected_background = QColor(0xCC, 0xCC, 0xCC)
 
         # The node background
         if self.selected:
             painter.setBrush(selected_background)
         else:
             painter.setBrush(normal_background)
-        painter.setPen(QPen(QColor(0xf0, 0xf0, 0xf0), 1.5))
+        painter.setPen(QPen(QColor(0xF0, 0xF0, 0xF0), 1.5))
         painter.drawRect(0, 0, self.width, self.height)
 
         x = 0
@@ -129,7 +138,7 @@ class QStateBlock(QGraphicsItem):
         # The addr label
         addr_label_x = x + self.HORIZONTAL_PADDING
         addr_label_y = y + self.VERTICAL_PADDING
-        painter.setPen(Qt.black)
+        painter.setPen(Qt.GlobalColor.black)
         painter.drawText(addr_label_x, addr_label_y + self._config.symexec_font_ascent, self._label_str)
 
         y += self._config.symexec_font_height + self.LINE_MARGIN
@@ -155,11 +164,12 @@ class QStateBlock(QGraphicsItem):
     # Private methods
     #
 
-    def _update_size(self):
-        width_candidates = [ self.HORIZONTAL_PADDING * 2 + len(self._label_str) * self._config.symexec_font_width,
-                             self.HORIZONTAL_PADDING * 2 + len(self._function_str) * self._config.symexec_font_width
-                             ]
-        height_candidates = [ 0 ]
+    def _update_size(self) -> None:
+        width_candidates = [
+            self.HORIZONTAL_PADDING * 2 + len(self._label_str) * self._config.symexec_font_width,
+            self.HORIZONTAL_PADDING * 2 + len(self._function_str) * self._config.symexec_font_width,
+        ]
+        height_candidates = [0]
         self._width = max(width_candidates)
         self._height = max(height_candidates)
 

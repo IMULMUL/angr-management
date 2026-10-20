@@ -1,32 +1,108 @@
-from typing import Optional, TYPE_CHECKING
-import time
+from __future__ import annotations
 
-from ...logic.threads import gui_thread_schedule_async
-from .job import Job
+import multiprocessing
+import platform
+from typing import TYPE_CHECKING
+
+from angrmanagement.data.analysis_options import AnalysisConfiguration, BoolAnalysisOption, IntAnalysisOption
+from angrmanagement.logic.threads import gui_thread_schedule_async
+
+from .job import InstanceJob
 
 if TYPE_CHECKING:
-    from ..instance import Instance
+    from angrmanagement.data.instance import Instance
+    from angrmanagement.logic.jobmanager import JobContext
 
 
-class VariableRecoveryJob(Job):
+class VariableRecoveryConfiguration(AnalysisConfiguration):
+    """
+    Configuration for VariableRecovery analysis.
+    """
+
+    SMALL_BINARY_SIZE = 65_536
+    MEDIUM_BINARY_SIZE = 400_000
+
+    def __init__(self, instance: Instance) -> None:
+        super().__init__(instance)
+        self.name = "varec"
+        self.display_name = "Recover Variables on All Functions"
+        self.description = (
+            "Perform a full-project variable recovery and calling-convention recovery analysis. "
+            "Recommended for small- to medium-sized binaries. This analysis takes a long time to "
+            "finish on large binaries. You can manually perform a variable recovery and "
+            "calling-convention recovery analysis on an individual basis after loading the project."
+        )
+        self.enabled = self.get_main_obj_size() <= self.MEDIUM_BINARY_SIZE
+        self.options = {
+            o.name: o
+            for o in [
+                IntAnalysisOption(
+                    "workers",
+                    "Number of parallel workers",
+                    tooltip="0 to disable parallel analysis. Default to the number of available cores "
+                    "in the local system (capped at 4). Automatically default to 0 for small binaries "
+                    "on all platforms, and small- to medium-sized binaries on Windows and MacOS "
+                    "(to avoid the cost of spawning new angr-management processes).",
+                    default=self.get_default_workers(),
+                    minimum=0,
+                ),
+                BoolAnalysisOption(
+                    "skip_signature_matched_functions",
+                    "Skip variable recovery for signature-matched functions",
+                    True,
+                ),
+                BoolAnalysisOption(
+                    "analyze_callsites",
+                    "Analyze callsites of each function to improve prototype recovery",
+                    False,
+                ),
+            ]
+        }
+
+    def get_default_workers(self) -> int:
+        main_obj_size = self.get_main_obj_size()
+
+        default_workers = min(multiprocessing.cpu_count(), 4)
+        if default_workers == 1:
+            return 0
+
+        if platform.system() in {"Windows", "Darwin"}:
+            if main_obj_size <= self.MEDIUM_BINARY_SIZE:
+                return 0
+            return default_workers
+
+        if main_obj_size <= self.SMALL_BINARY_SIZE:
+            return 0
+        return default_workers
+
+
+class VariableRecoveryJob(InstanceJob):
     """
     Identify variables and recover calling convention for a specific, or all function if no function is specified.
     """
 
-    def __init__(self, on_finish=None, on_variable_recovered=None, workers: Optional[int]=None, **kwargs):
-        super().__init__(name="Variable Recovery", on_finish=on_finish)
+    def __init__(
+        self,
+        instance: Instance,
+        on_finish=None,
+        on_variable_recovered=None,
+        workers: int | None = None,
+        func_addr: int | None = None,
+        auto_start: bool = False,
+        **kwargs,
+    ) -> None:
+        super().__init__("Variable Recovery", instance, on_finish=on_finish)
 
         self.variable_recovery_args = kwargs
         self.on_variable_recovered = on_variable_recovered
         self.workers = workers
         self.ccc = None
-        self.instance: Optional['Instance'] = None
         self.started = False
-        self.func_addrs_to_prioritize = set()
+        self.auto_start = auto_start
+        self.func_addr = func_addr
+        self.func_addrs_to_prioritize = set() if func_addr is None else {func_addr}
 
-        self._last_progress_callback_triggered = None
-
-    def prioritize_function(self, func_addr: int):
+    def prioritize_function(self, func_addr: int) -> None:
         """
         Prioritize the specified function and its callee functions.
 
@@ -46,57 +122,39 @@ class VariableRecoveryJob(Job):
         callees = set(self.instance.kb.functions.callgraph.successors(func_addr))
         self.ccc.prioritize_functions({func_addr} | callees)
 
-    def _run(self, inst: 'Instance'):
-        self.instance = inst
+    def run(self, ctx: JobContext) -> None:
         self.started = True
 
-        if self.on_variable_recovered is not None:
-            cc_callback = self._cc_callback
-        else:
-            cc_callback = None
+        cc_callback = self._cc_callback if self.on_variable_recovered is not None else None
 
         # update addrs to prioritize with their callees
         func_addrs_to_prioritize = set()
         if self.func_addrs_to_prioritize:
             for func_addr in self.func_addrs_to_prioritize:
-                callees = set(self.instance.kb.functions.callgraph.successors(func_addr))
-                func_addrs_to_prioritize |= {func_addr} | callees
+                if func_addr in self.instance.kb.functions:
+                    callees = set(self.instance.kb.functions.callgraph.successors(func_addr))
+                    func_addrs_to_prioritize |= {func_addr} | callees
 
-        self.ccc = inst.project.analyses.CompleteCallingConventions(
+        self.ccc = self.instance.project.analyses.CompleteCallingConventions(
             recover_variables=True,
             low_priority=True,
-            cfg=inst.cfg.am_obj,
-            progress_callback=self._progress_callback,
+            cfg=self.instance.cfg.am_obj,
+            progress_callback=ctx.set_progress,
             cc_callback=cc_callback,
-            analyze_callsites=True,
             max_function_blocks=300,
             max_function_size=4096,
             workers=0 if self.workers is None else self.workers,
             prioritize_func_addrs=func_addrs_to_prioritize,
-            auto_start=False,
+            skip_other_funcs=self.func_addr is not None,
+            auto_start=self.auto_start,
             **self.variable_recovery_args,
         )
         self.ccc.work()
 
-    def _cc_callback(self, func_addr: int):
+        self.ccc = None
+
+    def _cc_callback(self, func_addr: int) -> None:
         gui_thread_schedule_async(self.on_variable_recovered, args=(func_addr,))
 
-    def _progress_callback(self, percentage, text=None):
-
-        t = time.time()
-        if self._last_progress_callback_triggered is not None and t - self._last_progress_callback_triggered < 0.2:
-            return
-        self._last_progress_callback_triggered = t
-
-        progress_text = "%.02f%%" % percentage
-        if text:
-            progress_text += " | " + text
-
-        super()._progress_callback(percentage, text=progress_text)
-
-    def finish(self, inst, result):
-        self.ccc = None  # essentially disabling self.prioritize_function()
-        super().finish(inst, result)
-
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "<Variable Recovery Job>"

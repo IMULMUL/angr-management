@@ -1,49 +1,60 @@
-import time
+from __future__ import annotations
+
 import logging
-from threading import Thread
-from queue import Queue
-from typing import List, Optional, Type, Union, Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 import angr
-from angr.block import Block
-from angr.knowledge_base import KnowledgeBase
+from angr.analyses.decompiler.edits import NullEditHooks
+from angr.analyses.decompiler.edits import set_comment as core_set_comment
 from angr.analyses.disassembly import Instruction
+from angr.block import Block
+from angr.knowledge_plugins import Function
+from cle import SymbolType
 
-from .jobs import CFGGenerationJob
+from angrmanagement.config import Conf
+from angrmanagement.data.annotations import AnnotationManager, CommentKind
+from angrmanagement.data.breakpoint import Breakpoint, BreakpointManager, BreakpointType
+from angrmanagement.data.signatures import SignatureManager
+from angrmanagement.data.trace import Trace
+from angrmanagement.errors import ContainerAlreadyRegisteredError
+from angrmanagement.logic.debugger import DebuggerListManager, DebuggerManager
+
+from .log import LogRecord, initialize
 from .object_container import ObjectContainer
-from .log import LogRecord, LogDumpHandler
-from ..logic import GlobalInfo
-from ..logic.threads import gui_thread_schedule_async, gui_thread_schedule
-from ..logic.debugger import DebuggerListManager, DebuggerManager
-from ..logic.debugger.simgr import SimulationDebugger
-from ..data.trace import Trace
-from ..data.breakpoint import BreakpointManager
 
 if TYPE_CHECKING:
-    from ..ui.workspace import Workspace
+    from collections.abc import Callable
+
+    from angr.knowledge_plugins.cfg import CFGModel
+
+    from angrmanagement.data.analysis_options import AnalysesConfiguration
+
+_l = logging.getLogger(__name__)
+
+
+class _InstanceEditHooks(NullEditHooks):
+    """Forwards angr's edit notifications to the instance's comment-changed callback."""
+
+    def __init__(self, instance: Instance) -> None:
+        self._instance = instance
+
+    def before_comment_changed(self, addr: int, old: str, new: str, created: bool, decomp: bool) -> None:
+        if self._instance.handle_comment_changed_callback is not None:
+            self._instance.handle_comment_changed_callback(addr, old, new, created, decomp)
 
 
 class Instance:
     """
     An object to give access to normal angr project objects like a Project, CFG, and other analyses.
     """
-    project: Union[angr.Project, ObjectContainer]
-    cfg: Union[angr.analyses.cfg.CFGBase, ObjectContainer]
-    cfb: Union[angr.analyses.cfg.CFBlanket, ObjectContainer]
-    log: Union[List[LogRecord], ObjectContainer]
 
-    def __init__(self):
-        # pylint:disable=import-outside-toplevel)
-        # delayed import
-        from ..ui.views.interaction_view import PlainTextProtocol, BackslashTextProtocol, ProtocolInteractor,\
-            SavedInteraction
+    project: ObjectContainer
+    cfg: CFGModel | ObjectContainer
+    cfb: angr.analyses.cfg.CFBlanket | ObjectContainer
+    log: list[LogRecord] | ObjectContainer
 
-        self._live = False
-        self.workspace: Optional['Workspace'] = None
-
-        self.jobs = []
-        self._jobs_queue = Queue()
-        self.current_job = None
+    def __init__(self) -> None:
+        self.analysis_configuration: AnalysesConfiguration | None = None
 
         self.extra_containers = {}
         self._container_defaults = {}
@@ -53,65 +64,59 @@ class Instance:
         # where this binary is now - if it's loaded from a URL, then binary_path will be its temporary location on the
         # local machine
         self.binary_path = None
-        self.register_container('project', lambda: None, Optional[angr.Project], "The current angr project")
-        self.register_container('simgrs', lambda: [], List[angr.SimulationManager], 'Global simulation managers list')
-        self.register_container('states', lambda: [], List[angr.SimState], 'Global states list')
-        self.register_container('patches', lambda: None, None, 'Global patches update notifier') # dummy
-        self.register_container('cfg', lambda: None, Optional[angr.knowledge_plugins.cfg.CFGModel], "The current CFG")
-        self.register_container('cfb', lambda: None, Optional[angr.analyses.cfg.CFBlanket], "The current CFBlanket")
-        self.register_container('interactions', lambda: [], List[SavedInteraction], 'Saved program interactions')
-        # TODO: the current setup will erase all loaded protocols on a new project load! do we want that?
-        self.register_container('interaction_protocols',
-                                lambda: [PlainTextProtocol, BackslashTextProtocol],
-                                List[Type[ProtocolInteractor]],
-                                'Available interaction protocols')
-        self.register_container('log', lambda: [], List[LogRecord], 'Saved log messages')
-        self.register_container('current_trace', lambda: None, Type[Trace], 'Currently selected trace')
-        self.register_container('traces', lambda: [], List[Trace], 'Global traces list')
+        self.register_container("project", lambda: None, angr.Project | None, "The current angr project")
+        self.register_container("simgrs", list, list[angr.SimulationManager], "Global simulation managers list")
+        self.register_container("states", list, list[angr.SimState], "Global states list")
+        self.register_container("patches", lambda: None, None, "Global patches update notifier")  # dummy
+        self.register_container("cfg", lambda: None, angr.knowledge_plugins.cfg.CFGModel | None, "The current CFG")
+        self.register_container("cfb", lambda: None, angr.analyses.cfg.CFBlanket | None, "The current CFBlanket")
+        self.register_container("log", list, list[LogRecord], "Saved log messages", logging_permitted=False)
+        self.register_container("current_trace", lambda: None, type[Trace], "Currently selected trace")
+        self.register_container("traces", list, list[Trace], "Global traces list")
+
+        self.register_container("active_view_state", lambda: None, "ViewState", "Currently focused view state")
 
         self.breakpoint_mgr = BreakpointManager()
+        self.annotations = AnnotationManager(self)
+        self.signature_mgr = SignatureManager(self)
         self.debugger_list_mgr = DebuggerListManager()
         self.debugger_mgr = DebuggerManager(self.debugger_list_mgr)
 
-        self.simgrs.am_subscribe(self._update_simgr_debuggers)
         self.project.am_subscribe(self.initialize)
 
+        self.functions_to_inline = set()
+
         # Callbacks
-        self._insn_backcolor_callback = None  # type: Union[None, Callable[[int, bool], None]]   #  (addr, is_selected)
-        self._label_rename_callback = None  # type: Union[None, Callable[[int, str], None]]      #  (addr, new_name)
-        self._set_comment_callback = None  # type: Union[None, Callable[[int, str], None]]       #  (addr, comment_text)
+        self._insn_backcolor_callback: Callable[[int, bool], None] | None = None  # (addr, is_selected)
+        self._label_rename_callback: Callable[[int, str], None] | None = None  # (addr, new_name)
+        self._set_comment_callback: Callable[[int, str], None] | None = None  # (addr, comment_text)
+        self.handle_comment_changed_callback: Callable[[int, str, bool, bool, bool], None] | None = None
 
-        self._logging_handler = LogDumpHandler(self)
-
-        # Register a root logger
-        logging.root.handlers.insert(0, self._logging_handler)
+        # Setup logging
+        initialize(self)
 
         self.cfg_args = None
+        # addresses that a cancelled CFG recovery job did not get to process; informational
+        self.cfg_resume_frontier: set[int] = set()
+        # the resume state (unprocessed jobs and unresolved indirect jumps) captured by a cancelled CFG recovery
+        # job; used for resuming CFG recovery with full fidelity
+        self.cfg_resume_state = None
         self.variable_recovery_args = None
-        self._disassembly = {}
-        self.pseudocode_variable_kb = None
-
-        self._start_worker()
 
         self.database_path = None
-
-        # The image name when loading image
-        self.img_name = None
-
-        self._live = True
 
     #
     # Properties
     #
 
     @property
-    def kb(self) -> Optional[angr.KnowledgeBase]:
+    def kb(self) -> angr.KnowledgeBase | None:
         if self.project.am_none:
             return None
         return self.project.kb
 
     def __getattr__(self, k):
-        if k == 'extra_containers':
+        if k == "extra_containers":
             return {}
 
         try:
@@ -119,7 +124,7 @@ class Instance:
         except KeyError:
             return super().__getattribute__(k)
 
-    def __setattr__(self, k, v):
+    def __setattr__(self, k, v) -> None:
         if k in self.extra_containers:
             self.extra_containers[k].am_obj = v
         else:
@@ -133,7 +138,7 @@ class Instance:
         return self._insn_backcolor_callback
 
     @insn_backcolor_callback.setter
-    def insn_backcolor_callback(self, v):
+    def insn_backcolor_callback(self, v) -> None:
         self._insn_backcolor_callback = v
 
     @property
@@ -141,71 +146,44 @@ class Instance:
         return self._label_rename_callback
 
     @label_rename_callback.setter
-    def label_rename_callback(self, v):
+    def label_rename_callback(self, v) -> None:
         self._label_rename_callback = v
 
     @property
-    def set_comment_callback(self):
+    def set_comment_callback(self) -> Callable[[int, str], None] | None:
         return self._set_comment_callback
 
     @set_comment_callback.setter
-    def set_comment_callback(self, v):
+    def set_comment_callback(self, v) -> None:
         self._set_comment_callback = v
 
     #
     # Public methods
     #
 
-    def register_container(self, name, default_val_func, ty, description):
+    def register_container(self, name: str, default_val_func, ty, description: str, logging_permitted: bool = True):
         if name in self.extra_containers:
             cur_ty = self._container_defaults[name][1]
             if ty != cur_ty:
-                raise Exception("Container %s already registered with different type: %s != %s" % (name, ty, cur_ty))
+                raise ContainerAlreadyRegisteredError(
+                    f"Container {name} already registered with different type: {ty} != {cur_ty}"
+                )
 
         else:
             self._container_defaults[name] = (default_val_func, ty)
-            self.extra_containers[name] = ObjectContainer(default_val_func(), description)
+            self.extra_containers[name] = ObjectContainer(
+                default_val_func(), description, logging_permitted=logging_permitted
+            )
 
-    def initialize(self, initialized=False, cfg_args=None, variable_recovery_args=None, **kwargs):  # pylint:disable=unused-argument
+    def initialize(self, initialized: bool = False) -> None:  # pylint:disable=unused-argument
         if self.project.am_none:
             return
 
-        if not initialized:
-            if self.pseudocode_variable_kb is None:
-                self.initialize_pseudocode_variable_kb()
+        self.patches.am_obj = self.kb.patches
 
-            if cfg_args is None:
-                cfg_args = {}
-            # save cfg_args
-            self.cfg_args = cfg_args
+        self._apply_llm_config()
 
-            if variable_recovery_args is None:
-                variable_recovery_args = {}
-            self.variable_recovery_args = variable_recovery_args
-
-            # generate CFG
-            cfg_job = self.generate_cfg()
-
-            # start daemon
-            self._start_daemon_thread(self._refresh_cfg, 'Progressively Refreshing CFG', args=(cfg_job,))
-        self.workspace.plugins.handle_project_initialization()
-
-    def initialize_pseudocode_variable_kb(self):
-        self.pseudocode_variable_kb = KnowledgeBase(self.project.am_obj, name="pseudocode_variable_kb")
-
-    def generate_cfg(self):
-        cfg_job = CFGGenerationJob(
-            on_finish=self.workspace.on_cfg_generated,
-            **self.cfg_args
-        )
-        self.add_job(cfg_job)
-        return cfg_job
-
-    def add_job(self, job):
-        self.jobs.append(job)
-        self._jobs_queue.put(job)
-
-    def get_instruction_text_at(self, addr):
+    def get_instruction_text_at(self, addr: int):
         """
         Get the text representation of an instruction at `addr`.
 
@@ -224,119 +202,118 @@ class Instance:
             return None
 
         if isinstance(obj, Block):
+            if obj._using_pcode_engine:
+                # TODO: Support getting disassembly from pypcode
+                return "..."
+
             for insn in obj.capstone.insns:
                 if insn.address == addr:
                     insn_piece = Instruction(insn, None, project=self.project)
                     return insn_piece.render()[0]
         return None
 
-    def interrupt_current_job(self):
-        """Notify the current running job that the user requested an interrupt. The job may ignore it."""
-        # Due to thread scheduling, current_job reference *must* first be saved on the stack. Accessing self.current_job
-        # multiple times will lead to a race condition.
-        current_job = self.current_job
-        if current_job:
-            current_job.keyboard_interrupt()
-
-    def join_all_jobs(self):
-        # ...lol
-        while self.jobs:
-            time.sleep(0.05)
-
-    def append_code_to_console(self, hook_code_string):
-        console = self.workspace._get_or_create_console_view()
-        console.set_input_buffer(hook_code_string)
-
-    def delete_hook(self, addr):
+    def delete_hook(self, addr: int) -> None:
         self.project.unhook(addr)
+
+    def add_breakpoint(self, obj: str | int, type_: str | None = None, size: int | None = None) -> None:
+        """
+        Convenience function to add a breakpoint.
+
+        Examples:
+        - `instance.add_breakpoint(0x1234)` sets an execution breakpoint on address 0x1234
+        - `instance.add_breakpoint('main')` sets an execution breakpoint on `main` function
+        - `instance.add_breakpoint('global_value')` sets a write breakpoint on `global_value`
+        - `instance.add_breakpoint('global_value', 'read', 1)` sets a 1-byte read breakpoint on `global_value`
+        """
+        if isinstance(obj, int):
+            addr = obj
+        elif isinstance(obj, str):
+            sym = self.project.loader.find_symbol(obj)
+            if sym is None:
+                _l.error("Couldn't resolve '%s'", obj)
+                return
+            addr = sym.rebased_addr
+            if not size:
+                size = sym.size
+            if not type_:
+                type_ = "execute" if sym.type == SymbolType.TYPE_FUNCTION else "write"
+        elif type(obj) is Function:
+            addr = obj.addr
+            if not type_:
+                type_ = "execute"
+        else:
+            _l.error("Unexpected target object type. Expected int | str | Function")
+            return
+
+        if not size:
+            size = 1
+
+        bp_type_map = {
+            None: BreakpointType.Execute,
+            "execute": BreakpointType.Execute,
+            "write": BreakpointType.Write,
+            "read": BreakpointType.Read,
+        }
+        if type_ not in bp_type_map:
+            _l.error("Unknown breakpoint type '%s'. Expected %s", type_, " | ".join(bp_type_map.keys()))
+            return
+
+        bp = Breakpoint(bp_type_map[type_], addr, size)
+        self.breakpoint_mgr.add_breakpoint(bp)
+
+    def set_comment(self, addr: int, comment_text: str | None, kind: CommentKind | None = None) -> None:
+        """
+        Set (or, with empty text, remove) the comment at ``addr``.
+
+        Goes through angr's edit layer for the knowledge-base write and the plugin notification.
+        Mirroring into the pseudocode is left to :meth:`CodeView.sync_kb_comments`, which owns the
+        codegen's statement comments and can place them where they render inline.
+        """
+        core_set_comment(
+            self.project.am_obj,
+            addr,
+            comment_text,
+            kind=kind,
+            kb=self.kb,
+            hooks=_InstanceEditHooks(self),
+            mirror_to_pseudocode=False,
+            rerender=False,
+        )
+        self.annotations.notify_comments_changed(addr)
+
+        # TODO: can this be removed?
+        if self.set_comment_callback is not None:
+            self.set_comment_callback(addr, comment_text)  # pylint:disable=not-callable
 
     #
     # Private methods
     #
 
-    @staticmethod
-    def _start_daemon_thread(target, name, args=None):
-        t = Thread(target=target, name=name, args=args if args else tuple())
-        t.daemon = True
-        t.start()
-
-    def _start_worker(self):
-        self._start_daemon_thread(self._worker, 'angr-management Worker Thread')
-
-    def _worker(self):
-
-        while True:
-            if self._jobs_queue.empty():
-                gui_thread_schedule(GlobalInfo.main_window.progress_done, args=())
-
-            if self.workspace is not None and any(job.blocking for job in self.jobs):
-                gui_thread_schedule(self.workspace.main_window._progress_dialog.hide, args=())
-
-            job = self._jobs_queue.get()
-            gui_thread_schedule_async(GlobalInfo.main_window.progress, args=("Working...", 0.0))
-
-            if any(job.blocking for job in self.jobs):
-                if self.workspace.main_window.isVisible():
-                    gui_thread_schedule(self.workspace.main_window._progress_dialog.show, args=())
-
+    def _apply_llm_config(self) -> None:
+        """Apply GUI LLM configuration to the project's llm_client."""
+        model = Conf.llm_model
+        if model and not self.project.am_none:
             try:
-                self.current_job = job
-                result = job.run(self)
-                self.current_job = None
-            except Exception as e: # pylint: disable=broad-except
-                self.current_job = None
-                self.workspace.log('Exception while running job "%s":' % job.name)
-                self.workspace.log(e)
-            else:
-                gui_thread_schedule_async(job.finish, args=(self, result))
+                from angr.llm_client import LLMClient  # pylint: disable=import-outside-toplevel
 
-    # pylint:disable=no-self-use
-    def _set_status(self, status_text):
-        GlobalInfo.main_window.status = status_text
+                self.project.am_obj.llm_client = LLMClient(
+                    model=model,
+                    api_key=Conf.llm_api_key or None,
+                    api_base=Conf.llm_api_base or None,
+                )
+            except ImportError:
+                _l.error(
+                    "Failed to import angr.llm_client.LLMClient. Make sure you have the 'llm' extra installed to "
+                    "use LLM features."
+                )
 
-    def _refresh_cfg(self, cfg_job):
-        # reload once and then refresh in a loop
-        reloaded = False
-        while True:
-            if not self.cfg.am_none:
-                if self.workspace is not None:
-                    if reloaded:
-                        gui_thread_schedule_async(self.workspace.refresh,
-                                                  kwargs={'categories': ['disassembly', 'functions'],}
-                                                  )
-                    else:
-                        gui_thread_schedule_async(self.workspace.reload,
-                                                  kwargs={'categories': ['disassembly', 'functions'],}
-                                                  )
-                        reloaded = True
-
-            time.sleep(0.3)
-            if cfg_job not in self.jobs:
-                break
-
-    def _reset_containers(self, **kwargs):
-        # pylint:disable=consider-using-dict-items
-        for name in self.extra_containers:
-            self.extra_containers[name].am_obj = self._container_defaults[name][0]()
-            self.extra_containers[name].am_event(**kwargs)
+    def _reset_containers(self) -> None:
+        for name, container in self.extra_containers.items():
+            container.am_obj = self._container_defaults[name][0]()
+            container.am_event()
 
         for dbg in list(self.debugger_list_mgr.debugger_list):
             self.debugger_list_mgr.remove_debugger(dbg)
 
         self.breakpoint_mgr.clear()
-
-    def _update_simgr_debuggers(self, **kwargs):  # pylint:disable=unused-argument
-        sim_dbg = None
-        for dbg in self.debugger_list_mgr.debugger_list:
-            if isinstance(dbg, SimulationDebugger):
-                sim_dbg = dbg
-                break
-
-        if len(self.simgrs) > 0:
-            if sim_dbg is None:
-                view = self.workspace._get_or_create_symexec_view()._simgrs
-                dbg = SimulationDebugger(view, self.workspace)
-                self.debugger_list_mgr.add_debugger(dbg)
-                self.debugger_mgr.set_debugger(dbg)
-        elif sim_dbg is not None:
-            self.debugger_list_mgr.remove_debugger(sim_dbg)
+        self.annotations.clear()

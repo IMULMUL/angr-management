@@ -1,77 +1,112 @@
-from typing import Optional
+from __future__ import annotations
+
+import datetime
 import logging
 import time
-import datetime
+from enum import Enum
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any
 
-from ...logic import GlobalInfo
-from ...logic.threads import gui_thread_schedule_async
+from angrmanagement.logic import GlobalInfo
 
-try:
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from IPython.extensions.autoreload import ModuleReloader
-    m = ModuleReloader()
-    m.enabled = True
-    m.check_all = True
-    m.check()
-except ImportError:
-    m = None
 
-l = logging.getLogger(__name__)
+    from angrmanagement.data.instance import Instance
+    from angrmanagement.logic.jobmanager import JobContext
+
+
+log = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _module_reloader() -> ModuleReloader:
+    try:
+        from IPython.extensions.autoreload import ModuleReloader  # pylint:disable=import-outside-toplevel
+
+        m = ModuleReloader()
+        m.enabled = True
+        m.check_all = True
+        m.check()
+    except ImportError:
+        m = None
+
+    return m
+
+
+class JobState(Enum):
+    """
+    The state of a job.
+    """
+
+    PENDING = 0
+    RUNNING = 1
+    FINISHED = 2
+    CANCELLED = 3
+    FAILED = 4
+
 
 class Job:
-    def __init__(self, name, on_finish=None, blocking=False):
+    """
+    The base class of all Jobs in angr management.
+    """
+
+    name: str
+    progress_percentage: float
+    start_at: float
+    blocking: bool
+    state: JobState = JobState.PENDING
+    _on_finish: Callable[[Any], None] | None
+    result: Any
+
+    def __init__(self, name: str, on_finish: Callable[[Any], None] | None = None, blocking: bool = False) -> None:
         self.name = name
-        self.progress_percentage = 0.
-        self.last_text: Optional[str] = None
-        self.start_at: float = 0.
-        self.last_gui_updated_at: float = 0.
+        self.progress_percentage = 0.0
+        self.start_at = 0.0
         self.blocking = blocking
+        self.cancelled = False
+        self.result = None
 
         # callbacks
         self._on_finish = on_finish
 
-        if m is not None and GlobalInfo.autoreload:
-            prestate = dict(m.modules_mtimes)
-            m.check()
-            poststate = dict(m.modules_mtimes)
-            if prestate != poststate:
-                l.warning("Autoreload found changed modules")
+        if GlobalInfo.autoreload:
+            m = _module_reloader()
+            if m is not None:
+                prestate = dict(m.modules_mtimes)
+                m.check()
+                poststate = dict(m.modules_mtimes)
+                if prestate != poststate:
+                    log.warning("Auto-reload found changed modules")
 
     @property
     def time_elapsed(self) -> str:
         return str(datetime.timedelta(seconds=int(time.time() - self.start_at)))
 
-    def run(self, inst):
-        self.start_at = time.time()
-        return self._run(inst)
+    def start(self, ctx: JobContext):
+        self.result = self.run(ctx)
 
-    def _run(self, inst):
-        raise NotImplementedError()
+    def run(self, ctx: JobContext):
+        """Run the job. This method is called in a worker thread."""
+        raise NotImplementedError
 
-    def finish(self, inst, result): #pylint: disable=unused-argument
-        inst.jobs = inst.jobs[1:]
+    def finish(self) -> None:
+        """Runs after the job has finished in the GUI thread."""
+        if self._on_finish is not None:
+            self._on_finish(self.result)
 
-        gui_thread_schedule_async(self._finish_progress)
-        if self._on_finish:
-            gui_thread_schedule_async(self._on_finish)
 
-    def keyboard_interrupt(self):
-        """Called from the GUI thread when the user presses Ctrl+C or presses a cancel button"""
-        return
+class InstanceJob(Job):
+    """
+    A job that operates on an instance.
+    """
 
-    def _progress_callback(self, percentage, text=None):
-        delta = percentage - self.progress_percentage
+    instance: Instance
 
-        if (delta > 0.02 or self.last_text != text) and time.time() - self.last_gui_updated_at >= 0.1:
-            self.last_gui_updated_at = time.time()
-            self.progress_percentage = percentage
-            gui_thread_schedule_async(self._set_progress, args=(text,))
-
-    def _set_progress(self, text=None):
-        if text:
-            status = f"{self.name}: {text} - {self.time_elapsed}"
-        else:
-            status = f"{self.name} - {self.time_elapsed}"
-        GlobalInfo.main_window.progress(status, self.progress_percentage)
-
-    def _finish_progress(self):
-        pass
+    def __init__(
+        self, name: str, instance: Instance, on_finish: Callable[[Any], None] | None = None, blocking: bool = False
+    ):
+        super().__init__(name, on_finish, blocking)
+        self.instance = instance

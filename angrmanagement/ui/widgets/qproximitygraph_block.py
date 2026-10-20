@@ -1,32 +1,40 @@
-from typing import TYPE_CHECKING, List, Tuple, Type
-import logging
+from __future__ import annotations
 
-import PySide2.QtWidgets
-from PySide2.QtWidgets import QGraphicsSimpleTextItem
-from PySide2.QtGui import QPen
-from PySide2.QtCore import Qt, QRectF
+from typing import TYPE_CHECKING
 
-from angr.analyses.proximity_graph import FunctionProxiNode, CallProxiNode, StringProxiNode, \
-    IntegerProxiNode, UnknownProxiNode, VariableProxiNode
+from angr.analyses.proximity_graph import (
+    BaseProxiNode,
+    CallProxiNode,
+    FunctionProxiNode,
+    IntegerProxiNode,
+    StringProxiNode,
+    UnknownProxiNode,
+    VariableProxiNode,
+)
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QPen
+from PySide6.QtWidgets import QGraphicsSimpleTextItem
 
-from ...config import Conf
+from angrmanagement.config import Conf
+
 from .qgraph_object import QCachedGraphicsItem
 
 if TYPE_CHECKING:
-    from angrmanagement.ui.views.proximity_view import ProximityView
+    import PySide6.QtWidgets
 
-_l = logging.getLogger(__name__)
+    from angrmanagement.ui.views.proximity_view import ProximityView
 
 
 class QProximityGraphBlock(QCachedGraphicsItem):
     """
     Base Block
     """
+
     HORIZONTAL_PADDING = 5
     VERTICAL_PADDING = 5
     LINE_MARGIN = 3
 
-    def __init__(self, is_selected, proximity_view: 'ProximityView', node: 'BaseProxiNode'):
+    def __init__(self, is_selected: bool, proximity_view: ProximityView, node: BaseProxiNode) -> None:
         super().__init__()
 
         self._proximity_view = proximity_view
@@ -36,6 +44,13 @@ class QProximityGraphBlock(QCachedGraphicsItem):
         self.selected = is_selected
 
         self._node = node
+
+        addr = 0
+        if isinstance(node, (StringProxiNode, VariableProxiNode)):
+            addr = node.addr
+        elif isinstance(node, FunctionProxiNode):
+            addr = node.func.addr
+        self.addr = addr  # so that the block is sortable by GraphUtils._sort_node
 
         #
         # Colors
@@ -54,30 +69,30 @@ class QProximityGraphBlock(QCachedGraphicsItem):
 
         self.setAcceptHoverEvents(True)
 
-    def _init_widgets(self):
+    def _init_widgets(self) -> None:
         pass
 
-    def refresh(self):
+    def refresh(self) -> None:
         self._update_size()
 
     #
     # Event handlers
     #
 
-    def mousePressEvent(self, event):  # pylint: disable=useless-super-delegation
+    def mousePressEvent(self, event) -> None:  # pylint: disable=useless-super-delegation
         super().mousePressEvent(event)
 
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
             self.selected = not self.selected
             self._proximity_view.redraw_graph()
             event.accept()
 
         super().mouseReleaseEvent(event)
 
-    def mouseDoubleClickEvent(self, event):
+    def mouseDoubleClickEvent(self, event) -> None:
         # Jump to the reference address of the node
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             if self._node.ref_at:
                 self._workspace.viz(next(iter(self._node.ref_at)))
             event.accept()
@@ -85,13 +100,13 @@ class QProximityGraphBlock(QCachedGraphicsItem):
 
         super().mouseDoubleClickEvent(event)
 
-    def hoverEnterEvent(self, event: PySide2.QtWidgets.QGraphicsSceneHoverEvent):  # pylint:disable=unused-argument
+    def hoverEnterEvent(self, event: PySide6.QtWidgets.QGraphicsSceneHoverEvent) -> None:  # pylint:disable=unused-argument
         self._proximity_view.hover_enter_block(self)
 
-    def hoverLeaveEvent(self, event: PySide2.QtWidgets.QGraphicsSceneHoverEvent):  # pylint:disable=unused-argument
+    def hoverLeaveEvent(self, event: PySide6.QtWidgets.QGraphicsSceneHoverEvent) -> None:  # pylint:disable=unused-argument
         self._proximity_view.hover_leave_block(self)
 
-    def _paint_boundary(self, painter):
+    def _paint_boundary(self, painter) -> None:
         painter.setFont(Conf.symexec_font)
         normal_background = Conf.proximity_node_background_color
         selected_background = Conf.proximity_node_selected_background_color
@@ -105,7 +120,7 @@ class QProximityGraphBlock(QCachedGraphicsItem):
         painter.setPen(QPen(border_color, 1.5))
         painter.drawRect(0, 0, self.width, self.height)
 
-    def paint(self, painter, option, widget):  # pylint: disable=unused-argument
+    def paint(self, painter, option, widget) -> None:  # pylint: disable=unused-argument
         """
         Paint a state block on the scene.
 
@@ -133,7 +148,7 @@ class QProximityGraphBlock(QCachedGraphicsItem):
     # Private methods
     #
 
-    def _update_size(self):
+    def _update_size(self) -> None:
         self._width = 25
         self._height = 25
         self.recalculate_size()
@@ -144,20 +159,26 @@ class QProximityGraphFunctionBlock(QProximityGraphBlock):
     Function Block
     """
 
-    def __init__(self, is_selected, proximity_view: 'ProximityView', node: FunctionProxiNode):
+    def __init__(self, is_selected: bool, proximity_view: ProximityView, node: FunctionProxiNode) -> None:
         self._text = None
         self._text_item: QGraphicsSimpleTextItem = None
         super().__init__(is_selected, proximity_view, node)
 
-    def _init_widgets(self):
-        self._text = f"Function {self._node.func.name}"
+    def _init_widgets(self) -> None:
+        func_node = self._node.func
+        func = self._proximity_view.instance.kb.functions.get(func_node.addr)
+        func_name = func.name if func is not None else (func_node.func_name or hex(func_node.addr))
+        self._text = f"Function {func_name}"
         self._text_item = QGraphicsSimpleTextItem(self._text, self)
         self._text_item.setFont(Conf.symexec_font)
         self._text_item.setBrush(self.FUNCTION_NODE_TEXT_COLOR)
         self._text_item.setPos(self.HORIZONTAL_PADDING, self.VERTICAL_PADDING)
 
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.LeftButton and (event.modifiers() & Qt.ControlModifier) == Qt.ControlModifier:
+    def mouseDoubleClickEvent(self, event) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and (event.modifiers() & Qt.KeyboardModifier.ControlModifier) == Qt.KeyboardModifier.ControlModifier
+        ):
             # ctrl + double click to collapse a function call
             event.accept()
             self._proximity_view.collapse_function(self._node.func)
@@ -165,10 +186,10 @@ class QProximityGraphFunctionBlock(QProximityGraphBlock):
 
         super().mouseDoubleClickEvent(event)
 
-    def paint(self, painter, option, widget):
+    def paint(self, painter, option, widget) -> None:
         self._paint_boundary(painter)
 
-    def _update_size(self):
+    def _update_size(self) -> None:
         width_candidates = [
             self.HORIZONTAL_PADDING * 2 + self._text_item.boundingRect().width(),
         ]
@@ -186,20 +207,22 @@ class QProximityGraphCallBlock(QProximityGraphBlock):
     Call Block
     """
 
-    def __init__(self, is_selected, proximity_view: 'ProximityView', node: CallProxiNode):
+    def __init__(self, is_selected: bool, proximity_view: ProximityView, node: CallProxiNode) -> None:
         self._func_name: str = None
-        self._args: List[Tuple[Type, str]] = None
+        self._args: list[tuple[type, str]] = None
 
         self._func_name_item: QGraphicsSimpleTextItem = None
         self._left_parenthesis_item: QGraphicsSimpleTextItem = None
-        self._args_list: List[QGraphicsSimpleTextItem] = None
+        self._args_list: list[QGraphicsSimpleTextItem] = None
         self._right_parenthesis_item: QGraphicsSimpleTextItem = None
 
         super().__init__(is_selected, proximity_view, node)
 
-    def _init_widgets(self):
+    def _init_widgets(self) -> None:
         self._node: CallProxiNode
-        self._func_name = self._node.callee.name
+        callee_node = self._node.callee
+        func = self._proximity_view.instance.kb.functions.get(callee_node.addr)
+        self._func_name = func.name if func is not None else callee_node.func_name
         if self._node.args is not None:
             self._args = [self._argument_text(arg) for arg in self._node.args]
         else:
@@ -207,10 +230,10 @@ class QProximityGraphCallBlock(QProximityGraphBlock):
 
         # func name
         self._func_name_item = QGraphicsSimpleTextItem(self._func_name, self)
-        if self._node.callee.is_simprocedure:
+        if func is not None and func.is_simprocedure:
             pen_color = self.CALL_NODE_TEXT_COLOR_SIMPROC
-        elif self._node.callee.is_plt:
-            pen_color = self.CALL_NODE_TEXT_COLOR_SIMPROC
+        elif func is not None and func.is_plt:
+            pen_color = self.CALL_NODE_TEXT_COLOR_PLT
         else:
             pen_color = self.CALL_NODE_TEXT_COLOR
         self._func_name_item.setBrush(pen_color)
@@ -262,7 +285,7 @@ class QProximityGraphCallBlock(QProximityGraphBlock):
         self._right_parenthesis_item.setFont(Conf.symexec_font)
         self._right_parenthesis_item.setPos(x, y)
 
-    def _argument_text(self, arg) -> Tuple[Type, str]:  # pylint: disable=no-self-use
+    def _argument_text(self, arg) -> tuple[type, str]:  # pylint: disable=no-self-use
         if isinstance(arg, StringProxiNode):
             return StringProxiNode, '"' + arg.content.decode("utf-8").replace("\n", "\\n") + '"'
         elif isinstance(arg, IntegerProxiNode):
@@ -273,8 +296,11 @@ class QProximityGraphCallBlock(QProximityGraphBlock):
             return UnknownProxiNode, str(arg.dummy_value)
         return object, "Unknown"
 
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.LeftButton and (event.modifiers() & Qt.ControlModifier) == Qt.ControlModifier:
+    def mouseDoubleClickEvent(self, event) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and (event.modifiers() & Qt.KeyboardModifier.ControlModifier) == Qt.KeyboardModifier.ControlModifier
+        ):
             # ctrl + double click to expand a function call
             event.accept()
             self._proximity_view.expand_function(self._node.callee)
@@ -282,16 +308,16 @@ class QProximityGraphCallBlock(QProximityGraphBlock):
 
         super().mouseDoubleClickEvent(event)
 
-    def paint(self, painter, option, widget):
+    def paint(self, painter, option, widget) -> None:
         self._paint_boundary(painter)
 
-    def _update_size(self):
+    def _update_size(self) -> None:
         width_candidates = [
-            self.HORIZONTAL_PADDING * 2 +
-            self._func_name_item.boundingRect().width() +
-            self._left_parenthesis_item.boundingRect().width() +
-            sum(map(lambda x: x.boundingRect().width(), self._args_list)) +
-            self._right_parenthesis_item.boundingRect().width()
+            self.HORIZONTAL_PADDING * 2
+            + self._func_name_item.boundingRect().width()
+            + self._left_parenthesis_item.boundingRect().width()
+            + sum(x.boundingRect().width() for x in self._args_list)
+            + self._right_parenthesis_item.boundingRect().width()
         ]
 
         self._width = max(width_candidates)
@@ -307,12 +333,12 @@ class QProximityGraphStringBlock(QProximityGraphBlock):
     String Block
     """
 
-    def __init__(self, is_selected, proximity_view: 'ProximityView', node: StringProxiNode):
+    def __init__(self, is_selected: bool, proximity_view: ProximityView, node: StringProxiNode) -> None:
         self._text = None
         self._text_item: QGraphicsSimpleTextItem = None
         super().__init__(is_selected, proximity_view, node)
 
-    def _init_widgets(self):
+    def _init_widgets(self) -> None:
         self._text = '"' + self._node.content.decode("utf-8") + '"'
 
         self._text_item = QGraphicsSimpleTextItem(self._text, self)
@@ -320,10 +346,10 @@ class QProximityGraphStringBlock(QProximityGraphBlock):
         self._text_item.setFont(Conf.symexec_font)
         self._text_item.setPos(self.HORIZONTAL_PADDING, self.VERTICAL_PADDING)
 
-    def paint(self, painter, option, widget):
+    def paint(self, painter, option, widget) -> None:
         self._paint_boundary(painter)
 
-    def _update_size(self):
+    def _update_size(self) -> None:
         width_candidates = [
             self.HORIZONTAL_PADDING * 2 + self._text_item.boundingRect().width(),
         ]

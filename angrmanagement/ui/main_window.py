@@ -1,60 +1,151 @@
 # pylint:disable=no-self-use
-import os
+from __future__ import annotations
+
 import logging
+import os
 import pickle
-import sys
 import time
-from typing import Optional, TYPE_CHECKING
+import uuid
+from typing import TYPE_CHECKING
 
-from PySide2.QtWidgets import QMainWindow, QTabWidget, QFileDialog, QProgressBar, QProgressDialog
-from PySide2.QtWidgets import QMessageBox, QShortcut, QTabBar
-from PySide2.QtGui import QResizeEvent, QIcon, QDesktopServices, QKeySequence
-from PySide2.QtCore import Qt, QSize, QEvent, QTimer, QUrl
+import PySide6QtAds as QtAds
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices, QGuiApplication, QIcon, QKeySequence, QShortcut, QWindow
+from PySide6.QtWidgets import (
+    QDialog,
+    QFileDialog,
+    QMainWindow,
+    QMessageBox,
+    QWidget,
+)
 
-import angr
-import angr.flirt
+from angrmanagement.config import Conf, save_config
+from angrmanagement.consts import IMG_LOCATION
+from angrmanagement.daemon import daemon_conn, daemon_exists, run_daemon_process
+from angrmanagement.daemon.client import ClientService
+from angrmanagement.data.jobs import DependencyAnalysisJob
+from angrmanagement.data.jobs.loading import LoadBinaryJob
+from angrmanagement.data.library_docs import LibraryDocs
+from angrmanagement.data.signatures import init_flirt_signatures
+from angrmanagement.errors import InvalidURLError, UnexpectedStatusCodeError
+from angrmanagement.logic import GlobalInfo
+from angrmanagement.logic.commands import BasicCommand
+from angrmanagement.logic.threads import ExecuteCodeEvent
+from angrmanagement.mcp import MCPServerManager, is_mcp_available
+from angrmanagement.mcp.manager import DEFAULT_HOST, DEFAULT_PATH
+from angrmanagement.ui.dialogs.archive_loader import ArchiveLoaderDialog
+from angrmanagement.ui.dialogs.progress_dialog import ProgressDialog
+from angrmanagement.ui.views import DisassemblyView
+from angrmanagement.ui.widgets.qam_status_bar import QAmStatusBar
+from angrmanagement.utils.archive import is_archive
+from angrmanagement.utils.io import download_url, isurl
 
-try:
-    from angr.angrdb import AngrDB
-except ImportError:
-    AngrDB = None  # type: Optional[type]
-
-try:
-    import archr
-    import keystone
-except ImportError:
-    archr = None
-    keystone = None
-
-from ..daemon import daemon_exists, run_daemon_process, daemon_conn
-from ..daemon.client import ClientService
-from ..logic import GlobalInfo
-from ..data.instance import Instance
-from ..data.library_docs import LibraryDocs
-from ..data.jobs.loading import LoadTargetJob, LoadBinaryJob
-from ..data.jobs import DependencyAnalysisJob
-from ..config import IMG_LOCATION, Conf, save_config
-from ..utils.io import isurl, download_url
-from ..utils.env import is_pyinstaller, app_root
-from ..errors import InvalidURLError, UnexpectedStatusCodeError
-from .menus.file_menu import FileMenu
-from .menus.analyze_menu import AnalyzeMenu
-from .menus.help_menu import HelpMenu
-from .menus.view_menu import ViewMenu
-from .menus.plugin_menu import PluginMenu
-from .workspace import Workspace
-from .dialogs.load_plugins import LoadPlugins
-from .dialogs.load_docker_prompt import LoadDockerPrompt, LoadDockerPromptError
-from .dialogs.new_state import NewState
 from .dialogs.about import LoadAboutDialog
+from .dialogs.command_palette import CommandPaletteDialog
+from .dialogs.goto_palette import GotoPaletteDialog
+from .dialogs.load_plugins import LoadPlugins
+from .dialogs.new_state import NewState
 from .dialogs.preferences import Preferences
-from .toolbars import FileToolbar, DebugToolbar
+from .dialogs.welcome import WelcomeDialog
+from .menus.ai_menu import AIMenu
+from .menus.analyze_menu import AnalyzeMenu
+from .menus.file_menu import FileMenu
+from .menus.help_menu import HelpMenu
+from .menus.plugin_menu import PluginMenu
+from .menus.view_menu import ViewMenu
 from .toolbar_manager import ToolbarManager
+from .toolbars import DebugToolbar, FeatureMapToolbar, FileToolbar
+from .workspace import Workspace
 
 if TYPE_CHECKING:
-    from PySide2.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication
+
+    from angrmanagement.data.jobs import Job
+
 
 _l = logging.getLogger(name=__name__)
+
+
+class DockShortcutEventFilter(QObject):
+    """
+    Filter to support shortcuts on floating dock windows that overlap main window registered menu action shortcuts.
+    """
+
+    def __init__(self, main_window: MainWindow) -> None:
+        super().__init__()
+        self._main_window: MainWindow = main_window
+
+    def eventFilter(self, qobject, event) -> bool:
+        if event.type() == QEvent.Type.KeyPress and QKeySequence(event.keyCombination()) == QKeySequence(
+            "Ctrl+Shift+P"
+        ):
+            self._main_window.show_command_palette(qobject)
+            return True
+        return False
+
+
+class ShiftShiftEventFilter(QObject):
+    """
+    Filter to catch Shift+Shift key sequence for goto-anything activation.
+    """
+
+    activation_key = Qt.Key.Key_Shift
+    activation_count: int = 2
+    timeout_secs: float = 1
+
+    def __init__(self, main_window: MainWindow) -> None:
+        super().__init__()
+        self._main_window: MainWindow = main_window
+        self._press_count: int = 0
+        self._last_press_time: float = 0
+        self._did_process_qwindow_event: bool = False
+
+    def eventFilter(self, qobject, event) -> bool:
+        # Key Event propagation will begin at QWindow and continue down the widget tree. Use KeyEvent on QWindow to
+        # distinguish unique key presses, then intercept KeyEvent at first QWidget the event is propagated to.
+
+        if event.type() == QEvent.Type.KeyPress:
+            if isinstance(qobject, QWindow) and qobject.modality() == Qt.WindowModality.NonModal:
+                self._did_process_qwindow_event = True
+                return False
+            if not isinstance(qobject, QWidget) or not self._did_process_qwindow_event:
+                return False
+            self._did_process_qwindow_event = False
+
+            if event.count() == 1 and event.key() == self.activation_key:
+                now = time.time()
+                if now - self._last_press_time >= self.timeout_secs:
+                    self._press_count = 0
+                self._last_press_time = now
+
+                self._press_count += 1
+                if self._press_count >= self.activation_count:
+                    self._press_count = 0
+                    self._main_window.show_goto_palette(qobject)
+                    return True
+
+            else:
+                self._press_count = 0
+
+        return False
+
+
+class QExecuteCodeEventReceiver(QObject):
+    """
+    A class that receives ExecuteCodeEvent and executes the code on the GUI thread.
+    """
+
+    def event(self, event, /):
+        if not isinstance(event, ExecuteCodeEvent):
+            return False
+        try:
+            event.result = event.execute()
+        except Exception as ex:  # pylint:disable=broad-except
+            event.exception = ex
+            if event.async_:
+                _l.exception("Exception occurred in an async job:")
+        event.event.set()
+        return True
 
 
 class MainWindow(QMainWindow):
@@ -62,50 +153,66 @@ class MainWindow(QMainWindow):
     The main window of angr management.
     """
 
-    def __init__(self, app: Optional['QApplication'] = None, parent=None, show=True, use_daemon=False):
+    def __init__(
+        self,
+        app: QApplication | None = None,
+        parent=None,
+        show: bool = True,
+        use_daemon: bool = False,
+        use_mcp: bool | None = None,
+    ) -> None:
         super().__init__(parent)
+        self.initialized = False
 
-        icon_location = os.path.join(IMG_LOCATION, 'angr.png')
+        icon_location = os.path.join(IMG_LOCATION, "angr.png")
         self.setWindowIcon(QIcon(icon_location))
+        self.setWindowTitle("angr management")
 
         GlobalInfo.main_window = self
+        GlobalInfo.event_receiver = QExecuteCodeEventReceiver()
+        self.shown_at_start = show
 
         # initialization
         self.setMinimumSize(QSize(400, 400))
-        self.setDockNestingEnabled(True)
 
-        self.app: Optional['QApplication'] = app
+        self.app: QApplication | None = app
         self.workspace: Workspace = None
-        self.central_widget: QMainWindow = None
+        self.dock_manager: QtAds.CDockManager
+        self._dock_shortcut_event_filter = DockShortcutEventFilter(self)
+
+        self._shift_shift_event_filter = ShiftShiftEventFilter(self)
+        if app:
+            self.app.installEventFilter(self._shift_shift_event_filter)
 
         self.toolbar_manager: ToolbarManager = ToolbarManager(self)
-        self._progressbar = None  # type: QProgressBar
-        self._progress_dialog = None # type: QProgressDialog
-        self._load_binary_dialog = None
-
-        self.defaultWindowFlags = None
 
         # menus
         self._file_menu = None  # FileMenu
         self._analyze_menu = None
+        self._ai_menu = None
         self._view_menu = None
         self._help_menu = None
         self._plugin_menu = None
 
-        self._init_statusbar()
         self._init_workspace()
+        self._init_status_indicators()
         self._init_toolbars()
         self._init_menus()
         self._init_plugins()
         self._init_library_docs()
         self._init_url_scheme_handler()
 
+        self._register_commands()
+
         self.workspace.plugins.on_workspace_initialized(self)
 
         self._init_shortcuts()
-        self._init_flirt_signatures()
+        init_flirt_signatures()
 
         self._run_daemon(use_daemon=use_daemon)
+
+        self.mcp_server_manager: MCPServerManager | None = None
+        self._run_mcp(use_mcp=use_mcp)
 
         # I'm ready to show off!
         if show:
@@ -113,9 +220,12 @@ class MainWindow(QMainWindow):
             self.windowHandle().screenChanged.connect(self.on_screen_changed)
             self.show()
 
-        self.status = "Ready."
+    def show_welcome_dialog(self) -> None:
+        dlg = WelcomeDialog(self)
+        dlg.setModal(True)
+        dlg.show()
 
-    def sizeHint(self, *args, **kwargs):  # pylint: disable=unused-argument,no-self-use
+    def sizeHint(self):  # pylint: disable=no-self-use
         return QSize(1200, 800)
 
     #
@@ -127,7 +237,7 @@ class MainWindow(QMainWindow):
         return self.getWindowTitle()
 
     @caption.setter
-    def caption(self, v):
+    def caption(self, v) -> None:
         self.setWindowTitle(v)
 
     #
@@ -137,42 +247,36 @@ class MainWindow(QMainWindow):
     def open_mainfile_dialog(self):
         # pylint: disable=assigning-non-slot
         # https://github.com/PyCQA/pylint/issues/3793
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open a binary", Conf.last_used_directory,
-                                                   "All executables (*);;"
-                                                   "Windows PE files (*.exe);;"
-                                                   "Core Dumps (*.core);;"
-                                                   "angr database (*.adb)",
-                                                   )
-        Conf.last_used_directory = os.path.dirname(file_path)
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open a binary",
+            self._get_recent_dir(),
+            "All executables (*)"
+            ";;Windows PE files (*.exe)"
+            ";;Core Dumps (*.core)"
+            ";;angr database (*.adb)"
+            ";;Archives (*.zip *.tar *.tar.gz *.tgz *.tar.bz2 *.tbz2 *.tar.xz *.txz)",
+        )
         return file_path
 
-    def _pick_image_dialog(self):
-        try:
-            prompt = LoadDockerPrompt(parent=self)
-        except LoadDockerPromptError:
-            return None
-        if prompt.exec_() == 0:
-            return None  # User canceled
-        return prompt.textValue()
-
-    def open_load_plugins_dialog(self):
+    def open_load_plugins_dialog(self) -> None:
         dlg = LoadPlugins(self.workspace.plugins)
         dlg.setModal(True)
         dlg.exec_()
 
-    def open_newstate_dialog(self):
-        if self.workspace.instance.project.am_none:
-            QMessageBox.critical(self,
-                                 "Cannot create new states",
-                                 "Please open a binary to analyze first.")
+    def open_newstate_dialog(self) -> None:
+        if self.workspace.main_instance.project.am_none:
+            QMessageBox.critical(self, "Cannot create new states", "Please open a binary to analyze first.")
             return
-        new_state_dialog = NewState(self.workspace.instance, parent=self, create_simgr=True)
+        new_state_dialog = NewState(self.workspace, self.workspace.main_instance, parent=self, create_simgr=True)
         new_state_dialog.exec_()
 
-    def open_doc_link(self):
-        QDesktopServices.openUrl(QUrl("https://docs.angr.io/", QUrl.TolerantMode))
+    def open_doc_link(self) -> None:
+        QDesktopServices.openUrl(
+            QUrl("https://angr-management.readthedocs.io/en/latest/", QUrl.ParsingMode.TolerantMode)
+        )
 
-    def open_about_dialog(self):
+    def open_about_dialog(self) -> None:
         dlg = LoadAboutDialog()
         dlg.exec_()
 
@@ -180,41 +284,18 @@ class MainWindow(QMainWindow):
     # Widgets
     #
 
-    def _init_statusbar(self):
-        self._progressbar = QProgressBar()
-
-        self._progressbar.setMinimum(0)
-        self._progressbar.setMaximum(100)
-        self._progressbar.hide()
-
-        self.statusBar().addPermanentWidget(self._progressbar)
-
-        self._progress_dialog = QProgressDialog("Waiting...", "Cancel", 0, 100, self)
-        self._progress_dialog.setAutoClose(False)
-        self._progress_dialog.setWindowFlags(self._progress_dialog.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self._progress_dialog.setModal(True)
-        self._progress_dialog.setMinimumDuration(2**31 - 1)
-        def on_cancel():
-            if self.workspace is None:
-                return
-            for job in self.workspace.instance.jobs:
-                if job.blocking:
-                    job.keyboard_interrupt()
-                    break
-        self._progress_dialog.canceled.connect(on_cancel)
-        self._progress_dialog.close()
-
-    def _init_toolbars(self):
-        for cls in (FileToolbar, DebugToolbar):
+    def _init_toolbars(self) -> None:
+        for cls in (FileToolbar, DebugToolbar, FeatureMapToolbar):
             self.toolbar_manager.show_toolbar_by_class(cls)
 
     #
     # Menus
     #
 
-    def _init_menus(self):
+    def _init_menus(self) -> None:
         self._file_menu = FileMenu(self)
         self._analyze_menu = AnalyzeMenu(self)
+        self._ai_menu = AIMenu(self)
         self._view_menu = ViewMenu(self)
         self._help_menu = HelpMenu(self)
         self._plugin_menu = PluginMenu(self)
@@ -222,14 +303,10 @@ class MainWindow(QMainWindow):
         for path in Conf.recent_files:
             self._file_menu.add_recent(path)
 
-        # TODO: Eventually fix menu bars to have native support on MacOS
-        # if on a Mac, don't use the native menu bar (bug mitigation from QT)
-        if sys.platform == 'darwin':
-            self.menuBar().setNativeMenuBar(False)
-
         self.menuBar().addMenu(self._file_menu.qmenu())
         self.menuBar().addMenu(self._view_menu.qmenu())
         self.menuBar().addMenu(self._analyze_menu.qmenu())
+        self.menuBar().addMenu(self._ai_menu.qmenu())
         self.menuBar().addMenu(self._plugin_menu.qmenu())
         self.menuBar().addMenu(self._help_menu.qmenu())
 
@@ -237,97 +314,106 @@ class MainWindow(QMainWindow):
     # Workspace
     #
 
-    def _init_workspace(self):
+    def _init_workspace(self) -> None:
         """
         Initialize workspace
 
         :return:    None
         """
-        self.central_widget = QMainWindow()
-        self.setCentralWidget(self.central_widget)
-        wk = Workspace(self, Instance())
+        QtAds.CDockManager.setConfigFlags(
+            (
+                QtAds.CDockManager.DefaultBaseConfig
+                | QtAds.CDockManager.OpaqueSplitterResize
+                | QtAds.CDockManager.FocusHighlighting
+            )
+            & ~QtAds.CDockManager.DockAreaHasUndockButton
+        )
+        self.dock_manager = QtAds.CDockManager(self)
+        self.dock_manager.setStyleSheet("")  # Clear stylesheet overrides
+        self.dock_manager.setAutoHideConfigFlags(QtAds.CDockManager.DefaultAutoHideConfig)
+        self.dock_manager.createSideTabBarWidgets()
+        self.setCentralWidget(self.dock_manager)
+        wk = Workspace(self)
         self.workspace = wk
-        self.workspace.view_manager.tabify_center_views()
-        self.central_widget.setTabPosition(Qt.RightDockWidgetArea, QTabWidget.North)
-        self.central_widget.setDockNestingEnabled(True)
 
-        def set_caption(**kwargs):  # pylint: disable=unused-argument
-            if self.workspace.instance.project.am_none:
-                self.caption = ''
-            elif self.workspace.instance.project.filename is None:
+        def set_caption(**kwargs) -> None:  # pylint: disable=unused-argument
+            if self.workspace.main_instance.project.am_none:
+                self.caption = ""
+            elif self.workspace.main_instance.project.filename is None:
                 self.caption = "Loaded from stream"
             else:
-                self.caption = os.path.basename(self.workspace.instance.project.filename)
+                self.caption = os.path.basename(self.workspace.main_instance.project.filename)
 
-        self.workspace.instance.project.am_subscribe(set_caption)
+        self.workspace.main_instance.project.am_subscribe(set_caption)
 
-        self.tab = self.central_widget.findChild(QTabBar)
-        self.tab.tabBarClicked.connect(self.on_center_tab_clicked)
+    #
+    # Status
+    #
+
+    def _init_status_indicators(self):
+        """
+        Initialize job status indicators, including the status bar and progress dialog.
+        """
+        self._status_bar = QAmStatusBar(self)
+        self._progress_dialog = ProgressDialog(self)
+        self._progress_dialog.canceled.connect(self.workspace.job_manager.interrupt_current_job)
+
+        self.workspace.job_manager.job_starting.connect(self._on_job_starting)
+        self.workspace.job_manager.job_progressed.connect(self._on_job_progress)
+        self.workspace.job_manager.job_exception.connect(self._on_job_finished)
+        self.workspace.job_manager.job_finished.connect(self._on_job_finished)
 
     #
     # Shortcuts
     #
 
-    def interrupt_current_job(self):
-        self.workspace.instance.interrupt_current_job()
-
-    def _init_shortcuts(self):
+    def _init_shortcuts(self) -> None:
         """
         Initialize shortcuts
 
         :return:    None
         """
 
-        center_dockable_views = self.workspace.view_manager.get_center_views()
-        for i in range(1, len(center_dockable_views) + 1):
-            QShortcut(QKeySequence('Ctrl+' + str(i)), self, center_dockable_views[i - 1].raise_)
+        for i in range(1, 10):
+            QShortcut(QKeySequence(f"Alt+{i}"), self, lambda idx=i: self._raise_view(idx - 1))
+        QShortcut(QKeySequence("Alt+0"), self, lambda: self._raise_view(9))
 
-        QShortcut(QKeySequence("Ctrl+I"), self, self.interrupt_current_job)
+        QShortcut(QKeySequence("Ctrl+Shift+I"), self, self.workspace.job_manager.interrupt_current_job)
 
         # Raise the DisassemblyView after everything has initialized
-        center_dockable_views[0].raise_()
+        self._raise_view(0)
 
         # Toggle exec breakpoint
-        QShortcut(QKeySequence(Qt.Key_F2), self, self.workspace.toggle_exec_breakpoint)
+        QShortcut(QKeySequence(Qt.Key.Key_F2), self, self.workspace.toggle_exec_breakpoint)
 
         # Single step
-        QShortcut(QKeySequence(Qt.Key_F7), self, self.workspace.step_forward)
+        QShortcut(QKeySequence(Qt.Key.Key_F7), self, self.workspace.step_forward)
 
         # Run
-        QShortcut(QKeySequence(Qt.Key_F9), self, self.workspace.continue_forward)
+        QShortcut(QKeySequence(Qt.Key.Key_F9), self, self.workspace.continue_forward)
+
+        # Bookmarks
+        QShortcut(QKeySequence("Ctrl+M"), self, self.workspace.toggle_bookmark)
+        QShortcut(QKeySequence("Ctrl+Shift+M"), self, self.workspace.goto_next_bookmark)
+
+    def init_shortcuts_on_dock(self, dock_widget) -> None:
+        """
+        Installs an event filter on the dock widget to support floating dock global shortcuts (e.g. command palette).
+        """
+        dock_widget.installEventFilter(self._dock_shortcut_event_filter)
 
     #
     # Plugins
     #
 
-    def _init_plugins(self):
+    def _init_plugins(self) -> None:
         self.workspace.plugins.discover_and_initialize_plugins()
-
-    #
-    # FLIRT Signatures
-    #
-
-    def _init_flirt_signatures(self):
-        if Conf.flirt_signatures_root:
-            # if it's a relative path, it's relative to the angr-management package
-            if os.path.isabs(Conf.flirt_signatures_root):
-                flirt_signatures_root = Conf.flirt_signatures_root
-            else:
-                if is_pyinstaller():
-                    flirt_signatures_root = os.path.join(app_root(), Conf.flirt_signatures_root)
-                else:
-                    # when running as a Python package, we should use the git submodule, which is on the same level
-                    # with (instead of inside) the angrmanagement module directory.
-                    flirt_signatures_root = os.path.join(app_root(), "..", Conf.flirt_signatures_root)
-            flirt_signatures_root = os.path.normpath(flirt_signatures_root)
-            _l.info("Loading FLIRT signatures from %s.", flirt_signatures_root)
-            angr.flirt.load_signatures(flirt_signatures_root)
 
     #
     # Library docs
     #
 
-    def _init_library_docs(self):
+    def _init_library_docs(self) -> None:
         GlobalInfo.library_docs = LibraryDocs()
         if Conf.library_docs_root:
             GlobalInfo.library_docs.load_func_docs(Conf.library_docs_root)
@@ -336,8 +422,7 @@ class MainWindow(QMainWindow):
     # Daemon
     #
 
-    def _run_daemon(self, use_daemon=None):
-
+    def _run_daemon(self, use_daemon=None) -> None:
         if use_daemon is None:
             # Load it from the configuration file
             use_daemon = Conf.use_daemon
@@ -364,179 +449,366 @@ class MainWindow(QMainWindow):
             break
 
         from rpyc import BgServingThread  # pylint:disable=import-outside-toplevel
+
         _ = BgServingThread(GlobalInfo.daemon_conn)
+
+        GlobalInfo.client_id = str(uuid.uuid4())
+        GlobalInfo.daemon_conn.root.register_client(GlobalInfo.client_id)
+
+    #
+    # MCP server
+    #
+
+    def _run_mcp(self, use_mcp: bool | None = None) -> None:
+        if use_mcp is None:
+            # Load it from the configuration file
+            use_mcp = Conf.mcp_server_autostart
+
+        if not use_mcp:
+            return
+
+        # Defer the autostart until the event loop is running and the main window is shown. Starting
+        # it here (during __init__, while the always-on-top splash screen is up) would block startup
+        # and, on failure, pop a modal dialog hidden behind the splash. Autostart failures are
+        # reported non-modally so a busy port never blocks launch.
+        QTimer.singleShot(0, self._autostart_mcp_server)
+
+    def _autostart_mcp_server(self) -> None:
+        self.start_mcp_server(interactive=False)
+
+    def start_mcp_server(self, interactive: bool = True) -> None:
+        """
+        Start the embedded MCP server.
+
+        :param interactive: When True (a user action, e.g. the menu), errors are shown in a modal
+                            dialog. When False (autostart at launch), errors are only logged and
+                            surfaced in the status bar so they cannot block startup.
+        """
+
+        def report_error(title: str, message: str) -> None:
+            if interactive:
+                QMessageBox.critical(self, title, message)
+            else:
+                _l.warning("%s: %s", title, message)
+                self.statusBar().showMessage(f"{title}: {message}", 10000)
+
+        if not is_mcp_available():
+            report_error(
+                "MCP server unavailable",
+                "The MCP server requires the fastmcp and uvicorn packages. "
+                'Install them with "pip install angr-management[llm]".',
+            )
+            return
+
+        if self.mcp_server_manager is not None and self.mcp_server_manager.running:
+            self.statusBar().showMessage(f"The MCP server is already running at {self.mcp_server_manager.url}", 10000)
+            return
+
+        auth_token = None
+        if Conf.mcp_server_auth_enabled:
+            auth_token = Conf.mcp_server_auth_token or MCPServerManager.generate_auth_token()
+            if not Conf.mcp_server_auth_token:
+                # persist the generated token so it stays stable across restarts
+                Conf.mcp_server_auth_token = auth_token
+                save_config()
+
+        manager = MCPServerManager(self.workspace, port=Conf.mcp_server_port, auth_token=auth_token)
+        try:
+            manager.start()
+        except RuntimeError as ex:
+            report_error("Failed to start MCP server", str(ex))
+            return
+
+        self.mcp_server_manager = manager
+        auth_note = " (bearer-token auth enabled)" if auth_token else ""
+        self.statusBar().showMessage(f"MCP server listening at {manager.url}{auth_note}", 10000)
+
+    def stop_mcp_server(self) -> None:
+        if self.mcp_server_manager is None or not self.mcp_server_manager.running:
+            self.statusBar().showMessage("The MCP server is not running", 5000)
+            return
+
+        self.mcp_server_manager.stop()
+        self.mcp_server_manager = None
+        self.statusBar().showMessage("MCP server stopped", 5000)
+
+    def copy_mcp_url(self) -> None:
+        if self.mcp_server_manager is not None and self.mcp_server_manager.running:
+            url = self.mcp_server_manager.url
+            auth_token = self.mcp_server_manager.auth_token
+        else:
+            url = f"http://{DEFAULT_HOST}:{Conf.mcp_server_port}{DEFAULT_PATH}"
+            auth_token = Conf.mcp_server_auth_token if Conf.mcp_server_auth_enabled else None
+
+        if auth_token:
+            text = f"{url}\nAuthorization: Bearer {auth_token}"
+            message = "Copied MCP URL and auth token to clipboard"
+        else:
+            text = url
+            message = f"Copied to clipboard: {url}"
+
+        QGuiApplication.clipboard().setText(text)
+        self.statusBar().showMessage(message, 5000)
 
     #
     # URL scheme handler setup
     #
 
-    def _init_url_scheme_handler(self):
+    def _init_url_scheme_handler(self) -> None:
+        if "CI" in os.environ:
+            return
+
         # URL scheme
-        from ..logic.url_scheme import AngrUrlScheme  # pylint:disable=import-outside-toplevel
+        from angrmanagement.logic.url_scheme import AngrUrlScheme  # pylint:disable=import-outside-toplevel
 
         scheme = AngrUrlScheme()
         registered, _ = scheme.is_url_scheme_registered()
         supported = scheme.is_url_scheme_supported()
-        checrs_plugin = self.workspace.plugins.get_plugin_instance_by_name("ChessConnector")
-        if checrs_plugin is None:
-            return
 
-        if not registered and supported:
-            btn = QMessageBox.question(None, "Setting up angr URL scheme",
-                                       "angr URL scheme allows \"deep linking\" from browsers and other applications "
-                                       "by registering the angr:// protocol to the current user. Do you want to "
-                                       "register it? You may unregister at any "
-                                       "time in Preferences.",
-                                       defaultButton=QMessageBox.Yes)
-            if btn == QMessageBox.Yes:
+        if not registered and supported and not Conf.prompted_for_url_scheme_registration:
+            btn = QMessageBox.question(
+                None,
+                "Setting up angr URL scheme",
+                'angr URL scheme allows "deep linking" from browsers and other applications '
+                "by registering the angr:// protocol to the current user. Do you want to "
+                "register it? You may unregister at any "
+                "time in Preferences.",
+                defaultButton=QMessageBox.StandardButton.Yes,
+            )
+            if btn == QMessageBox.StandardButton.Yes:
                 try:
                     AngrUrlScheme().register_url_scheme()
                 except (ValueError, FileNotFoundError) as ex:
-                    QMessageBox.warning(None, "Error in registering angr URL scheme",
-                                        "Failed to register the angr URL scheme.\n"
-                                        "The following exception occurred:\n"
-                                        + str(ex))
+                    QMessageBox.warning(
+                        None,
+                        "Error in registering angr URL scheme",
+                        "Failed to register the angr URL scheme.\nThe following exception occurred:\n" + str(ex),
+                    )
+                    return
+
+            Conf.prompted_for_url_scheme_registration = True
+            save_config()
+
+    #
+    # Commands
+    #
+
+    def _register_commands(self) -> None:
+        """
+        Register basic window commands.
+        """
+        self.workspace.command_manager.register_commands(
+            [
+                BasicCommand(action.__name__, caption, action)
+                for caption, action in [
+                    ("AI: LLM Refine All", self.llm_refine_all),
+                    ("AI: LLM Suggest Variable Names", self.llm_suggest_variable_names),
+                    ("AI: LLM Suggest Function Name", self.llm_suggest_function_name),
+                    ("AI: LLM Suggest Variable Types", self.llm_suggest_variable_types),
+                    ("AI: LLM Summarize Function", self.llm_summarize_function),
+                    ("AI: Start MCP Server", self.start_mcp_server),
+                    ("AI: Stop MCP Server", self.stop_mcp_server),
+                    ("AI: Copy MCP Server URL", self.copy_mcp_url),
+                    ("Analyze: Decompile", self.decompile_current_function),
+                    ("Analyze: Run Analysis...", self.run_analysis),
+                    ("Bookmarks: Go to next bookmark", self.workspace.goto_next_bookmark),
+                    ("Bookmarks: Toggle bookmark", self.workspace.toggle_bookmark),
+                    ("File: Close project", self.close_project),
+                    ("File: Exit", self.quit),
+                    ("File: Load a new binary...", self.open_file_button),
+                    ("File: Load a new trace...", self.load_trace),
+                    ("File: Load angr database...", self.load_database),
+                    ("File: Load FLIRT signature file...", self.load_signature_button),
+                    ("File: Preferences...", self.preferences),
+                    ("File: Save angr database as...", self.save_database_as),
+                    ("File: Save angr database...", self.save_database),
+                    ("File: Save patched binary as...", self.save_patched_binary_as),
+                    ("Help: About", self.open_about_dialog),
+                    ("Help: Documentation", self.open_doc_link),
+                    ("View: Bookmarks", self.workspace.show_bookmarks_view),
+                    ("View: Breakpoints", self.workspace.show_breakpoints_view),
+                    ("View: Call Explorer", self.workspace.show_call_explorer_view),
+                    ("View: Comments", self.workspace.show_comments_view),
+                    ("View: Console", self.workspace.show_console_view),
+                    ("View: Disassembly (Graph)", self.workspace.show_graph_disassembly_view),
+                    ("View: Disassembly (Linear)", self.workspace.show_linear_disassembly_view),
+                    ("View: Functions", self.workspace.show_functions_view),
+                    ("View: Hex", self.workspace.show_hex_view),
+                    ("View: Function Signatures", self.workspace.show_signatures_view),
+                    ("View: Jobs", self.workspace.show_jobs_view),
+                    ("View: Log", self.workspace.show_log_view),
+                    ("View: MCP History", self.workspace.show_mcp_history_view),
+                    ("View: New Disassembly (Graph)", self.workspace.create_and_show_graph_disassembly_view),
+                    ("View: New Disassembly (Linear)", self.workspace.create_and_show_linear_disassembly_view),
+                    ("View: New Hex", self.workspace.create_and_show_hex_view),
+                    ("View: Patches", self.workspace.show_patches_view),
+                    ("View: Proximity", self.workspace.view_proximity_for_current_function),
+                    ("View: Pseudocode", self.workspace.show_pseudocode_view),
+                    ("View: Registers", self.workspace.show_registers_view),
+                    ("View: Search", self.workspace.show_search_view),
+                    ("View: Stack", self.workspace.show_stack_view),
+                    ("View: States", self.workspace.show_states_view),
+                    ("View: Strings", self.workspace.show_strings_view),
+                    ("View: Symbolic Execution", self.workspace.show_symexec_view),
+                    ("View: Trace map", self.workspace.show_trace_map_view),
+                    ("View: Traces", self.workspace.show_traces_view),
+                    ("View: Types", self.workspace.show_types_view),
+                ]
+            ]
+        )
 
     #
     # Event
     #
 
-    def resizeEvent(self, event: QResizeEvent):
-        """
-
-        :param event:
-        :return:
-        """
-
-        self._recalculate_view_sizes(event.oldSize())
-
-    def closeEvent(self, event):
-
+    def closeEvent(self, event) -> None:
         # Ask if the user wants to save things
-        if self.workspace.instance is not None and not self.workspace.instance.project.am_none:
-            msgbox = QMessageBox()
+        if (
+            self.workspace.main_instance is not None
+            and not self.workspace.main_instance.project.am_none
+            and self.shown_at_start
+        ):
+            msgbox = QMessageBox(self)
             msgbox.setWindowTitle("Save database")
             msgbox.setText("angr management is about to exit. Do you want to save the database?")
-            msgbox.setIcon(QMessageBox.Question)
+            msgbox.setIcon(QMessageBox.Icon.Question)
             msgbox.setWindowIcon(self.windowIcon())
-            msgbox.setStandardButtons(QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
-            msgbox.setDefaultButton(QMessageBox.Yes)
+            msgbox.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
+            )
+            msgbox.setDefaultButton(QMessageBox.StandardButton.Yes)
             r = msgbox.exec_()
 
-            if r == QMessageBox.Cancel:
+            if r == QMessageBox.StandardButton.Cancel:
                 event.ignore()
                 return
-            elif r == QMessageBox.Yes:
+            elif r == QMessageBox.StandardButton.Yes:
                 save_r = self.save_database()
                 if not save_r:
                     # failed to save the database
                     event.ignore()
                     return
 
-        for plugin in list(self.workspace.plugins.active_plugins):
+        for plugin in list(self.workspace.plugins.active_plugins.values()):
             self.workspace.plugins.deactivate_plugin(plugin)
+        self.workspace.job_manager.quit()
+
+        if self.mcp_server_manager is not None:
+            self.mcp_server_manager.stop(timeout=2)
+            self.mcp_server_manager = None
+
+        # force-close runtime db
+        if (
+            self.workspace.main_instance is not None
+            and not self.workspace.main_instance.project.am_none
+            and "rtdb" in self.workspace.main_instance.project.kb
+        ):
+            self.workspace.main_instance.kb.rtdb.cleanup()
+
         event.accept()
 
-    def event(self, event):
-
-        if event.type() == QEvent.User:
-            # our event callback
-
-            try:
-                event.result = event.execute()
-            except Exception as ex:  # pylint:disable=broad-except
-                event.exception = ex
-            event.event.set()
-
-            return True
-
-        return super().event(event)
-
-    def on_screen_changed(self, screen):
+    def on_screen_changed(self, screen) -> None:
         """
         When changing from one screen to another, ask disassembly views to refresh in case the DPI is changed.
         """
         self.workspace.current_screen.am_obj = screen
         self.workspace.current_screen.am_event()
 
-    def on_center_tab_clicked(self, index):
-        self.workspace.view_manager.handle_center_tab_click(index)
-
     #
     # Actions
     #
 
-    def reload(self):
+    def reload(self) -> None:
         self.workspace.reload()
 
-    def open_file_button(self):
+    def open_file_button(self) -> None:
+        if not self._ensure_no_open_project():
+            return
         file_path = self.open_mainfile_dialog()
         if not file_path:
             return
         self.load_file(file_path)
 
-    def open_trace_file_button(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open a trace file", Conf.last_used_directory,
-                                                   "All files (*);;"
-                                                   "Trace files (*.trace);;",
-                                                   )
-        Conf.last_used_directory = os.path.dirname(file_path)
+    def _ensure_no_open_project(self) -> bool:
+        """
+        Return True if it is OK to open a new project. If a project is already loaded, inform the
+        user that it must be closed first and return False.
+        """
+        if self.workspace.main_instance is None or self.workspace.main_instance.project.am_none:
+            return True
+        QMessageBox.warning(
+            self,
+            "A project is already open",
+            "A binary is already loaded. Please close it first (File → Close Project) before opening a new one.",
+        )
+        return False
+
+    def close_project(self) -> None:
+        if self.workspace.main_instance is None or self.workspace.main_instance.project.am_none:
+            return
+        msgbox = QMessageBox(self)
+        msgbox.setWindowTitle("Close project")
+        msgbox.setText("Close the current project? Any unsaved analysis will be lost.")
+        msgbox.setIcon(QMessageBox.Icon.Question)
+        msgbox.setWindowIcon(self.windowIcon())
+        msgbox.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msgbox.setDefaultButton(QMessageBox.StandardButton.No)
+        if msgbox.exec_() != QMessageBox.StandardButton.Yes:
+            return
+        self.workspace.close_project()
+
+    def open_trace_file_button(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open a trace file",
+            Conf.last_used_directory,
+            "All files (*);;Trace files (*.trace);;",
+        )
         if not file_path:
             return
+        Conf.last_used_directory = os.path.dirname(file_path)
         self.load_trace_file(file_path)
 
-    def open_docker_button(self):
-        required = {
-            'archr: git clone https://github.com/angr/archr && cd archr && pip install -e .': archr,
-            'keystone: pip install --no-binary keystone-engine keystone-engine': keystone
-        }
-        is_missing = [key for key, value in required.items() if value is None]
-        if len(is_missing) > 0:
-            req_msg = 'You need to install the following:\n\n\t' + '\n\t'.join(is_missing)
-            req_msg += '\n\nInstall them to enable this functionality.'
-            req_msg += '\nRelaunch angr-management after install.'
-            QMessageBox(self).critical(None, 'Dependency error', req_msg)
+    def load_signature_button(self) -> None:
+        sig_mgr = self.workspace.main_instance.signature_mgr
+        if sig_mgr is None:
             return
+        sig_mgr.load_signatures()
+        self.workspace.show_signatures_view()
 
-        img_name = self._pick_image_dialog()
-        if img_name is None:
-            return
-        target = archr.targets.DockerImageTarget(img_name, target_path=None)
-        self.workspace.instance.add_job(LoadTargetJob(target))
-        self.workspace.instance.img_name = img_name
-
-    def load_trace_file(self, file_path):
+    def load_trace_file(self, file_path) -> None:
         if isurl(file_path):
-            QMessageBox.critical(self,
-                                 "Unsupported Action",
-                                 "Downloading trace files is not yet supported."
-                                 "Please specify a path to a file on disk.")
+            QMessageBox.critical(
+                self,
+                "Unsupported Action",
+                "Downloading trace files is not yet supported. Please specify a path to a file on disk.",
+            )
         else:
             # File
             if os.path.isfile(file_path):
                 try:
-                    with open(file_path, 'rb') as f:
+                    with open(file_path, "rb") as f:
                         loaded_sim_state = pickle.load(f)
                         analysis_params = {
-                            'end_state': loaded_sim_state,
-                            'start_addr': None,
-                            'end_addr': None,
-                            'block_addrs': None,
+                            "end_state": loaded_sim_state,
+                            "start_addr": None,
+                            "end_addr": None,
+                            "block_addrs": None,
                         }
                         self.workspace.view_data_dependency_graph(analysis_params)
                     self._recent_file(file_path)
                 except pickle.PickleError:
-                    QMessageBox.critical(self,
-                                         "Unable to load trace file",
-                                         "Trace file must contain a serialized SimState.")
+                    QMessageBox.critical(
+                        self, "Unable to load trace file", "Trace file must contain a serialized SimState."
+                    )
             else:
-                QMessageBox.critical(self,
-                                     "File not found",
-                                     f"angr management cannot open file {file_path}. "
-                                     "Please make sure that the file exists.")
+                QMessageBox.critical(
+                    self,
+                    "File not found",
+                    f"angr management cannot open file {file_path}. Please make sure that the file exists.",
+                )
 
-    def load_file(self, file_path):
-
+    def load_file(self, file_path) -> None:
         if not isurl(file_path):
             # file
             if os.path.isfile(file_path):
@@ -544,49 +816,74 @@ class MainWindow(QMainWindow):
                     self.workspace.load_trace_from_path(file_path)
                     return
 
-                self.workspace.instance.binary_path = file_path
-                self.workspace.instance.original_binary_path = file_path
+                # a trace attaches to the current project, but a binary or database replaces it
+                if not self._ensure_no_open_project():
+                    return
+
+                self.workspace.main_instance.binary_path = file_path
+                self.workspace.main_instance.original_binary_path = file_path
+
+                if is_archive(file_path):
+                    dlg = ArchiveLoaderDialog(file_path, parent=self)
+                    if dlg.exec() != QDialog.DialogCode.Accepted or dlg.extracted_file_path is None:
+                        dlg.cleanup()
+                        return
+                    file_path = dlg.extracted_file_path
+                    self.workspace.main_instance.binary_path = file_path
+
                 if file_path.endswith(".adb"):
                     self._load_database(file_path)
                 else:
                     self._recent_file(file_path)
-                    self.workspace.instance.add_job(LoadBinaryJob(file_path))
+                    self.workspace.job_manager.add_job(LoadBinaryJob(self.workspace.main_instance, file_path))
             else:
-                QMessageBox.critical(self,
-                                     "File not found",
-                                     f"angr management cannot open file {file_path}. "
-                                     "Please make sure that the file exists.")
+                QMessageBox.critical(
+                    self,
+                    "File not found",
+                    f"angr management cannot open file {file_path}. Please make sure that the file exists.",
+                )
         else:
             # url
-            r = QMessageBox.question(self,
-                                     "Downloading a file",
-                                     f"Do you want to download a file from {file_path} and open it in angr management?",
-                                     defaultButton=QMessageBox.Yes)
-            if r == QMessageBox.Yes:
+            if not self._ensure_no_open_project():
+                return
+            r = QMessageBox.question(
+                self,
+                "Downloading a file",
+                f"Do you want to download a file from {file_path} and open it in angr management?",
+                defaultButton=QMessageBox.StandardButton.Yes,
+            )
+            if r == QMessageBox.StandardButton.Yes:
                 try:
                     target_path = download_url(file_path, parent=self, to_file=True, file_path=None)
                 except InvalidURLError:
-                    QMessageBox.critical(self,
-                                         "Downloading failed",
-                                         "angr management failed to download the file. The URL is invalid.")
+                    QMessageBox.critical(
+                        self, "Downloading failed", "angr management failed to download the file. The URL is invalid."
+                    )
                     return
                 except UnexpectedStatusCodeError as ex:
-                    QMessageBox.critical(self,
-                                         "Downloading failed",
-                                         "angr management failed to retrieve the header of the file. "
-                                         f"The HTTP request returned an unexpected status code {ex.status_code}.")
+                    QMessageBox.critical(
+                        self,
+                        "Downloading failed",
+                        "angr management failed to retrieve the header of the file. "
+                        f"The HTTP request returned an unexpected status code {ex.status_code}.",
+                    )
                     return
 
                 if target_path:
                     # open the file - now it's a local file
-                    self.workspace.instance.binary_path = target_path
-                    self.workspace.instance.original_binary_path = file_path
+                    self.workspace.main_instance.binary_path = target_path
+                    self.workspace.main_instance.original_binary_path = file_path
                     self.load_file(target_path)
 
-    def load_database(self):
+    def load_database(self) -> None:
+        if not self._ensure_no_open_project():
+            return
+
         # Open File window
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Load angr database", ".",
+            self,
+            "Load angr database",
+            ".",
             "angr databases (*.adb)",
         )
 
@@ -596,26 +893,27 @@ class MainWindow(QMainWindow):
         self._load_database(file_path)
 
     def save_database(self):
-        if self.workspace.instance is None or self.workspace.instance.project.am_none:
+        if self.workspace.main_instance is None or self.workspace.main_instance.project.am_none:
             return True
 
-        if self.workspace.instance.database_path is None:
+        if self.workspace.main_instance.database_path is None:
             return self.save_database_as()
         else:
-            return self._save_database(self.workspace.instance.database_path)
+            return self._save_database(self.workspace.main_instance.database_path)
 
     def save_database_as(self):
-
-        if self.workspace.instance is None or self.workspace.instance.project.am_none:
+        if self.workspace.main_instance is None or self.workspace.main_instance.project.am_none:
             return False
 
-        default_database_path = self.workspace.instance.database_path
+        default_database_path = self.workspace.main_instance.database_path
         if default_database_path is None:
-            default_database_path = os.path.normpath(self.workspace.instance.project.filename) + ".adb"
+            default_database_path = os.path.normpath(self.workspace.main_instance.project.filename) + ".adb"
 
         # Open File window
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save angr database", default_database_path,
+            self,
+            "Save angr database",
+            default_database_path,
             "angr databases (*.adb)",
         )
 
@@ -627,63 +925,106 @@ class MainWindow(QMainWindow):
 
         return self._save_database(file_path)
 
-    def load_trace(self):
+    def save_patched_binary_as(self) -> None:
+        if self.workspace.main_instance is None or self.workspace.main_instance.project.am_none:
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save patched binary as...",
+            self.workspace.main_instance.project.loader.main_object.binary
+            + ".patched",  # FIXME: this will not work if we are loading from an angrdb
+            "Any file (*)",
+        )
+
+        if file_path:
+            b = self.workspace.main_instance.project.kb.patches.apply_patches_to_binary()
+            with open(file_path, "wb") as f:
+                f.write(b)
+
+    def load_trace(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(self, "Load trace", ".", "bintrace (*.trace)")
         if not file_path:
             return
         self.workspace.load_trace_from_path(file_path)
 
-    def preferences(self):
-
-        # Open Preferences dialog
+    def preferences(self) -> None:
         pref = Preferences(self.workspace, parent=self)
         pref.exec_()
 
-    def quit(self):
+    def quit(self) -> None:
         self.close()
 
-    def run_variable_recovery(self):
-        self.workspace._get_or_create_disassembly_view().variable_recovery_flavor = 'accurate'
+    def run_variable_recovery(self) -> None:
+        self.workspace._get_or_create_view("disassembly", DisassemblyView).variable_recovery_flavor = "accurate"
 
-    def run_induction_variable_analysis(self):
-        self.workspace._get_or_create_disassembly_view().run_induction_variable_analysis()
+    def run_induction_variable_analysis(self) -> None:
+        self.workspace._get_or_create_view("disassembly", DisassemblyView).run_induction_variable_analysis()
 
-    def run_dependency_analysis(self, func_addr: Optional[int] = None, func_arg_idx: Optional[int] = None):
-        if self.workspace is None or self.workspace.instance is None:
+    def run_dependency_analysis(self, func_addr: int | None = None, func_arg_idx: int | None = None) -> None:
+        if self.workspace is None or self.workspace.main_instance is None:
             return
-        dep_analysis_job = DependencyAnalysisJob(func_addr=func_addr, func_arg_idx=func_arg_idx)
-        self.workspace.instance.add_job(dep_analysis_job)
+        dep_analysis_job = DependencyAnalysisJob(
+            self.workspace.main_instance, func_addr=func_addr, func_arg_idx=func_arg_idx
+        )
+        self.workspace.job_manager.add_job(dep_analysis_job)
 
-    def decompile_current_function(self):
+    def run_analysis(self) -> None:
+        if self.workspace:
+            self.workspace.run_analysis()
+
+    def decompile_current_function(self) -> None:
         if self.workspace is not None:
             self.workspace.decompile_current_function()
 
-    def view_proximity_for_current_function(self):
+    def discover_patterns(self) -> None:
+        if self.workspace is not None:
+            self.workspace.show_pattern_discovery()
+
+    def llm_refine_all(self) -> None:
+        if self.workspace is not None:
+            self.workspace.llm_refine_all()
+
+    def llm_suggest_variable_names(self) -> None:
+        if self.workspace is not None:
+            self.workspace.llm_suggest_variable_names()
+
+    def llm_suggest_function_name(self) -> None:
+        if self.workspace is not None:
+            self.workspace.llm_suggest_function_name()
+
+    def llm_suggest_variable_types(self) -> None:
+        if self.workspace is not None:
+            self.workspace.llm_suggest_variable_types()
+
+    def llm_summarize_function(self) -> None:
+        if self.workspace is not None:
+            self.workspace.llm_summarize_function()
+
+    def view_proximity_for_current_function(self) -> None:
         if self.workspace is not None:
             self.workspace.view_proximity_for_current_function()
 
-    def interact(self):
-        self.workspace.interact_program(self.workspace.instance.img_name)
+    def show_command_palette(self, parent=None) -> None:
+        dlg = CommandPaletteDialog(self.workspace, parent=(parent or self))
+        dlg.setModal(True)
+        dlg.exec_()
+        if dlg.selected_item:
+            dlg.selected_item.run()
+
+    def show_goto_palette(self, parent=None) -> None:
+        dlg = GotoPaletteDialog(self.workspace, parent=(parent or self))
+        dlg.setModal(True)
+        dlg.exec_()
+        if dlg.selected_item:
+            self.workspace.jump_to(dlg.selected_item.addr)
 
     #
     # Other public methods
     #
 
-    def progress(self, status, progress):
-        self.statusBar().showMessage(f'Working... {status}')
-        self._progress_dialog.setLabelText(status)
-        self._progressbar.show()
-        self._progressbar.setValue(progress)
-        self._progress_dialog.setValue(progress)
-
-
-    def progress_done(self):
-        self._progressbar.hide()
-        self.statusBar().showMessage("Ready.")
-        self._progress_dialog.hide()
-
-    def bring_to_front(self):
-        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+    def bring_to_front(self) -> None:
+        self.setWindowState((self.windowState() & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive)
         self.activateWindow()
         self.raise_()
 
@@ -691,135 +1032,49 @@ class MainWindow(QMainWindow):
     # Private methods
     #
 
-    def _recent_file(self, file_path):
+    def _recent_file(self, file_path) -> None:
         file_path = os.path.abspath(file_path)
         self._file_menu.add_recent(file_path)
         Conf.recent_file(file_path)
         save_config()
 
-    def _load_database(self, file_path):
+    def _get_recent_dir(self) -> str:
+        if Conf.recent_files:
+            recent_dir = os.path.dirname(Conf.recent_files[-1])
+            if os.path.isdir(recent_dir):
+                return recent_dir
+        return ""
 
-        if AngrDB is None:
-            QMessageBox.critical(None, 'Error',
-                                 'AngrDB is not enabled. Maybe you do not have SQLAlchemy installed?')
-            return
+    def _load_database(self, file_path: str) -> None:
+        self.workspace.load_database(file_path, on_loaded=self._recent_file)
 
-        angrdb = AngrDB()
-        other_kbs = {}
-        extra_info = {}
+    def _save_database(self, file_path) -> bool:
+        return self.workspace.save_database(file_path)
+
+    def _raise_view(self, idx: int) -> None:
+        """
+        Raise idx'th view in the dock manager
+        """
         try:
-            proj = angrdb.load(file_path, kb_names=["global", "pseudocode_variable_kb"], other_kbs=other_kbs,
-                               extra_info=extra_info)
-        except angr.errors.AngrIncompatibleDBError as ex:
-            QMessageBox.critical(None, 'Error',
-                                 "Failed to load the angr database because of compatibility issues.\n"
-                                 f"Details: {ex}")
+            dock = self.dock_manager.dockWidgets()[idx]
+        except IndexError:
             return
-        except angr.errors.AngrDBError as ex:
-            QMessageBox.critical(None, 'Error',
-                                 'Failed to load the angr database.\n'
-                                 f'Details: {ex}')
-            _l.critical("Failed to load the angr database.", exc_info=True)
-            return
+        dock.raise_()
 
-        self._recent_file(file_path)
+    def _on_job_starting(self, job: Job) -> None:
+        text, progress = "Working...", 0.0
+        self._status_bar.progress(text, progress, True)
+        if job.blocking:
+            self._progress_dialog.setLabelText(text)
+            self._progress_dialog.setValue(round(progress))
 
-        cfg = proj.kb.cfgs['CFGFast']
-        cfb = proj.analyses.CFB()  # it will load functions from kb
+    def _on_job_progress(self, job: Job, percentage: float, text: str = "") -> None:
+        text = f"{job.name}: {text}" if text else job.name
+        self._status_bar.progress(text, percentage)
+        if job.blocking:
+            self._progress_dialog.setLabelText(text)
+            self._progress_dialog.setValue(round(percentage))
 
-        self.workspace.instance.database_path = file_path
-
-        self.workspace.instance._reset_containers()
-        self.workspace.instance.project = proj
-        self.workspace.instance.cfg = cfg
-        self.workspace.instance.cfb = cfb
-        if "pseudocode_variable_kb" in other_kbs:
-            self.workspace.instance.pseudocode_variable_kb = other_kbs["pseudocode_variable_kb"]
-        else:
-            self.workspace.instance.initialize_pseudocode_variable_kb()
-        self.workspace.instance.project.am_event(initialized=True)
-
-        # trigger callbacks
-        self.workspace.reload()
-        self.workspace.on_cfg_generated()
-        self.workspace.plugins.angrdb_load_entries(extra_info)
-
-    def _save_database(self, file_path):
-        if self.workspace.instance is None or self.workspace.instance.project.am_none:
-            return False
-
-        if AngrDB is None:
-            QMessageBox.critical(None, 'Error',
-                                 'AngrDB is not enabled. Maybe you do not have SQLAlchemy installed?')
-            return False
-
-        self.workspace.plugins.handle_project_save(file_path)
-
-        angrdb = AngrDB(project=self.workspace.instance.project)
-        extra_info = self.workspace.plugins.angrdb_store_entries()
-        angrdb.dump(file_path, kbs=[
-            self.workspace.instance.kb,
-            self.workspace.instance.pseudocode_variable_kb,
-        ],
-                    extra_info=extra_info,
-                    )
-
-        self.workspace.instance.database_path = file_path
-        return True
-
-    def _recalculate_view_sizes(self, old_size):
-        adjustable_dockable_views = [dock for dock in self.workspace.view_manager.docks
-                                     if dock.widget().default_docking_position in ('left', 'bottom',)]
-
-        if not adjustable_dockable_views:
-            return
-
-        for dock in adjustable_dockable_views:
-            widget = dock.widget()
-
-            if old_size.width() < 0:
-                dock.old_size = widget.sizeHint()
-                continue
-
-            if old_size != self.size():
-                # calculate the width ratio
-
-                if widget.default_docking_position == 'left':
-                    # we want to adjust the width
-                    ratio = widget.old_width * 1.0 / old_size.width()
-                    new_width = int(self.width() * ratio)
-                    widget.width_hint = new_width
-                    widget.updateGeometry()
-                elif widget.default_docking_position == 'bottom':
-                    # we want to adjust the height
-                    ratio = widget.old_height * 1.0 / old_size.height()
-                    new_height = int(self.height() * ratio)
-                    widget.height_hint = new_height
-                    widget.updateGeometry()
-
-                dock.old_size = widget.size()
-
-    def _resize_dock_widget(self, dock_widget, new_width, new_height):
-
-        original_size = dock_widget.size()
-        original_min = dock_widget.minimumSize()
-        original_max = dock_widget.maximumSize()
-
-        dock_widget.resize(new_width, new_height)
-
-        if new_width != original_size.width():
-            if original_size.width() > new_width:
-                dock_widget.setMaximumWidth(new_width)
-            else:
-                dock_widget.setMinimumWidth(new_width)
-
-        if new_height != original_size.height():
-            if original_size.height() > new_height:
-                dock_widget.setMaximumHeight(new_height)
-            else:
-                dock_widget.setMinimumHeight(new_height)
-
-        dock_widget.original_min = original_min
-        dock_widget.original_max = original_max
-
-        QTimer.singleShot(1, dock_widget.restore_original_size)
+    def _on_job_finished(self, job: Job) -> None:  # pylint:disable=unused-argument
+        self._status_bar.progress_done()
+        self._progress_dialog.reset()

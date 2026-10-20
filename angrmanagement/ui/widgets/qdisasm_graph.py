@@ -1,20 +1,27 @@
-from typing import Optional, TYPE_CHECKING
-import logging
+from __future__ import annotations
 
-from PySide2.QtCore import QRect, QPointF, Qt, QSize, QEvent, QRectF, QTimeLine
+import logging
+from typing import TYPE_CHECKING
 
 from angr.analyses.decompiler.utils import to_ail_supergraph
+from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, Qt, QTimeLine
+from PySide6.QtWidgets import QFrame
 
-from ...utils import get_out_branches
-from ...utils.graph_layouter import GraphLayouter
-from ...utils.cfg import categorize_edges
+from angrmanagement.config import Conf
+from angrmanagement.logic.threads import needs_gui_thread
+from angrmanagement.utils import get_out_branches
+from angrmanagement.utils.cache import SmartLRUCache
+from angrmanagement.utils.cfg import categorize_edges
+from angrmanagement.utils.graph_layouter import GraphLayouter
+
 from .qblock import QGraphBlock
-from .qgraph_arrow import QDisasmGraphArrow
+from .qdisasm_base_control import DisassemblyLevel, QDisassemblyBaseControl
 from .qgraph import QZoomableDraggableGraphicsView
-from .qdisasm_base_control import QDisassemblyBaseControl, DisassemblyLevel
+from .qgraph_arrow import QDisasmGraphArrow
 from .qminimap import QMiniMapView
 
 if TYPE_CHECKING:
+    from angrmanagement.data.instance import Instance
     from angrmanagement.logic.disassembly import InfoDock
 
 
@@ -22,8 +29,16 @@ _l = logging.getLogger(__name__)
 
 
 class QViewPortMover:
-    def __init__(self, disasm_graph: 'QDisassemblyGraph', x:int, y:int, target_x: int, target_y: int,
-                 interval: int=700, max_frame: int=100):
+    def __init__(
+        self,
+        disasm_graph: QDisassemblyGraph,
+        x: int,
+        y: int,
+        target_x: int,
+        target_y: int,
+        interval: int = 700,
+        max_frame: int = 100,
+    ) -> None:
         self.disasm_graph = disasm_graph
         self.target_x = target_x
         self.target_y = target_y
@@ -37,22 +52,20 @@ class QViewPortMover:
         self._move_timeline.setFrameRange(0, max_frame)
         self._move_timeline.setUpdateInterval(10)
 
-    def start(self):
+    def start(self) -> None:
         self._move_timeline.frameChanged.connect(self._set_pos)
         self._move_timeline.start()
 
-    def _set_pos(self, step):
-        self.disasm_graph.centerOn(self.initial_x + self.x_step * step,
-                                   self.initial_y + self.y_step * step)
+    def _set_pos(self, step) -> None:
+        self.disasm_graph.centerOn(self.initial_x + self.x_step * step, self.initial_y + self.y_step * step)
 
 
 class QDisassemblyGraph(QDisassemblyBaseControl, QZoomableDraggableGraphicsView):
-
-    def __init__(self, workspace, disasm_view, parent=None):
-        QDisassemblyBaseControl.__init__(self, workspace, disasm_view, QZoomableDraggableGraphicsView)
+    def __init__(self, instance: Instance, disasm_view, parent=None) -> None:
+        QDisassemblyBaseControl.__init__(self, instance, disasm_view, QZoomableDraggableGraphicsView)
         QZoomableDraggableGraphicsView.__init__(self, parent=parent)
 
-        self.workspace = workspace
+        self.instance = instance
 
         self.disasm = None
         self.variable_manager = None
@@ -62,12 +75,17 @@ class QDisassemblyGraph(QDisassemblyBaseControl, QZoomableDraggableGraphicsView)
         self._viewport_mover = None
 
         self._edges = None
-        self._arrows = [ ]  # A list of references to QGraphArrow objects
+        self._arrows = []  # A list of references to QGraphArrow objects
 
-        self.blocks = [ ]
+        self.blocks = []
+        self.entry_block: QGraphBlock | None = None
+        self._ail_disasms = SmartLRUCache(maxsize=1024)
+        self._disasms = SmartLRUCache(maxsize=1024)
 
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.setFrameStyle(QFrame.Shape.NoFrame)
+        self.setBackgroundBrush(Conf.disasm_view_background_color)
 
         self._minimap = QMiniMapView(self, parent=self)
         self._minimap.setMaximumSize(200, 400)
@@ -83,8 +101,7 @@ class QDisassemblyGraph(QDisassemblyBaseControl, QZoomableDraggableGraphicsView)
         return self._function_graph
 
     @function_graph.setter
-    def function_graph(self, v):
-
+    def function_graph(self, v) -> None:
         if v is not self._function_graph:
             self._function_graph = v
 
@@ -95,59 +112,104 @@ class QDisassemblyGraph(QDisassemblyBaseControl, QZoomableDraggableGraphicsView)
         return self.infodock.induction_variable_analysis
 
     @induction_variable_analysis.setter
-    def induction_variable_analysis(self, v):
+    def induction_variable_analysis(self, v) -> None:
         self.infodock.induction_variable_analysis = v
 
     #
     # Public methods
     #
 
-    def reload(self, old_infodock: Optional['InfoDock']=None):
-
+    def reload(self, old_infodock: InfoDock | None = None) -> None:
         # if there is an instruction in selection, we will want to select that instruction again after reloading this
         # view.
-        if old_infodock is not None:
-            selected_insns = old_infodock.selected_insns.am_obj
-        else:
-            selected_insns = set()
+        selected_insns = old_infodock.selected_insns.am_obj if old_infodock is not None else set()
 
         self._reset_scene()
+        # _reset_scene() destroyed the C++ objects of the old block widgets; never keep a stale reference around
+        self.entry_block = None
         self._arrows.clear()
-        if self._function_graph is None:
-            return
-
         self.blocks.clear()
         self._insaddr_to_block.clear()
+        if self._function_graph is None:
+            self._minimap.reload_target_scene()
+            return
+
         scene = self.scene()
+        assert self.instance.kb is not None
 
         if self._disassembly_level is DisassemblyLevel.AIL:
-            self.disasm = self.workspace.instance.project.analyses.Clinic(
-                self._function_graph.function)
-            self._supergraph = to_ail_supergraph(self.disasm.graph)
-            nodefunc = lambda n: n
-            branchfunc = lambda n: None
+            func = self._function_graph.function
+            try:
+                # always check if decompiler has cached a clinic object first
+                self.disasm = self.instance.kb.decompilations[(func.addr, "pseudocode")].clinic
+            except (KeyError, AttributeError):
+                try:
+                    self.disasm = self._ail_disasms[func.addr]
+                except KeyError:
+                    self.disasm = self._ail_disasms[func.addr] = self.instance.project.analyses.Clinic(func)
+
+            self._supergraph = to_ail_supergraph(self.disasm.cc_graph)
+
+            def nodefunc(n):
+                return self._supergraph.nodes[n]["original_nodes"]
+
+            def branchfunc(supernode):
+                return None
+
+            has_idx = True
         else:
             include_ir = self._disassembly_level is DisassemblyLevel.LifterIR
-            self.disasm = self.workspace.instance.project.analyses.Disassembly(function=self._function_graph.function, include_ir=include_ir)
-            view = self.workspace.view_manager.first_view_in_category('console')
+            addr = self._function_graph.function.addr
+            cache_key = (addr, include_ir)
+            try:
+                self.disasm = self._disasms[cache_key]
+            except KeyError:
+                self.disasm = self._disasms[cache_key] = self.instance.project.analyses.Disassembly(
+                    function=self._function_graph.function, include_ir=include_ir
+                )
+            view = self.disasm_view.workspace.view_manager.first_view_in_category("console")
             if view is not None:
-                view.push_namespace({
-                    'disasm': self.disasm,
-                })
+                from angrmanagement.ui.views import ConsoleView  # pylint: disable=import-outside-toplevel
+
+                assert isinstance(view, ConsoleView)
+                view.push_namespace(
+                    {
+                        "disasm": self.disasm,
+                    }
+                )
             self._supergraph = self._function_graph.supergraph
-            nodefunc = lambda n: n.cfg_nodes
+
+            def nodefunc(n):
+                return n.cfg_nodes
+
             branchfunc = get_out_branches
+            has_idx = False
 
         for n in self._supergraph.nodes():
-            block = QGraphBlock(self.workspace, self._function_graph.function.addr, self.disasm_view, self.disasm,
-                                self.infodock, n.addr, nodefunc(n), branchfunc(n), scene)
+            block = QGraphBlock(
+                self.instance,
+                self._function_graph.function.addr,
+                self.disasm_view,
+                self.disasm,
+                self.infodock,
+                n.addr,
+                nodefunc(n),
+                branchfunc(n),
+                idx=n.idx if has_idx else None,
+            )
             if n.addr == self._function_graph.function.addr:
                 self.entry_block = block
             scene.addItem(block)
             self.blocks.append(block)
 
-            for insn_addr in block.addr_to_insns.keys():
+            for insn_addr in block.addr_to_insns:
                 self._insaddr_to_block[insn_addr] = block
+
+        if self.entry_block is None and self.blocks:
+            # no supernode starts exactly at the function address: the entry block may have been merged behind a
+            # lower-addressed block in the supergraph, or pruned. fall back to the block containing the function
+            # address, or the first block
+            self.entry_block = self._insaddr_to_block.get(self._function_graph.function.addr, self.blocks[0])
 
         self.request_relayout()
         self._update_scene_boundary()
@@ -156,12 +218,14 @@ class QDisassemblyGraph(QDisassemblyBaseControl, QZoomableDraggableGraphicsView)
         self._reset_view()
 
         # select the old instructions
+        assert selected_insns is not None
         for insn_addr in selected_insns:
             self.infodock.select_instruction(insn_addr, unique=False, use_animation=False)
 
         self._minimap.reload_target_scene()
 
-    def refresh(self):
+    @needs_gui_thread
+    def refresh(self) -> None:
         if not self.blocks:
             return
 
@@ -175,7 +239,7 @@ class QDisassemblyGraph(QDisassemblyBaseControl, QZoomableDraggableGraphicsView)
         self._minimap.reload_target_scene()
         self._minimap.setVisible(self.disasm_view.show_minimap)
 
-    def set_extra_render_pass(self, is_extra_pass:bool):
+    def set_extra_render_pass(self, is_extra_pass: bool) -> None:
         super().set_extra_render_pass(is_extra_pass)
         if not is_extra_pass:
             # We hide block objects in low LoD passes. Restore them now if
@@ -198,45 +262,30 @@ class QDisassemblyGraph(QDisassemblyBaseControl, QZoomableDraggableGraphicsView)
             return True
         return super().event(event)
 
-    def mousePressEvent(self, event):
+    def mousePressEvent(self, event) -> None:
         btn = event.button()
 
-        if btn == Qt.ForwardButton:
+        if btn == Qt.MouseButton.ForwardButton:
             self.disasm_view.jump_forward()
-        elif btn == Qt.BackButton:
+        elif btn == Qt.MouseButton.BackButton:
             self.disasm_view.jump_back()
         else:
             super().mousePressEvent(event)
 
-    def changeEvent(self, event: QEvent):
+    def changeEvent(self, event: QEvent) -> None:  # type: ignore
         """
         Redraw on color scheme update.
         """
-        if event.type() == QEvent.PaletteChange:
+        if event.type() == QEvent.Type.PaletteChange:
+            self.setBackgroundBrush(Conf.disasm_view_background_color)
             self.reload()
-
-    def on_background_click(self):
-        pass
 
     #
     # Layout
     #
 
-    def _graph_size(self):
-
-        width, height = 0, 0
-
-        for block in self.blocks:
-            if block.x + block.width > width:
-                width = block.x + block.width
-            if block.y + block.height > height:
-                height = block.y + block.height
-
-        # TODO: Check all edges as well
-
-        return QSize(width, height)
-
     def _layout_graph(self):
+        assert self._supergraph is not None
 
         node_sizes = {}
         node_map = {}
@@ -247,14 +296,13 @@ class QDisassemblyGraph(QDisassemblyBaseControl, QZoomableDraggableGraphicsView)
             node_sizes[node] = block.width, block.height
         gl = GraphLayouter(self._supergraph, node_sizes)
 
-        nodes = { }
+        nodes = {}
         for node, coords in gl.node_coordinates.items():
-            nodes[node.addr] = coords
+            nodes[(node.addr, node.idx)] = coords
 
         return nodes, gl.edges
 
-    def request_relayout(self):
-
+    def request_relayout(self) -> None:
         node_coords, edges = self._layout_graph()
 
         self._edges = edges
@@ -267,7 +315,7 @@ class QDisassemblyGraph(QDisassemblyBaseControl, QZoomableDraggableGraphicsView)
 
         # layout nodes
         for block in self.blocks:
-            x, y = node_coords[block.addr]
+            x, y = node_coords[(block.addr, block.idx)]
             block.setPos(x, y)
 
         scene = self.scene()
@@ -283,14 +331,16 @@ class QDisassemblyGraph(QDisassemblyBaseControl, QZoomableDraggableGraphicsView)
             scene.addItem(arrow)
             arrow.setPos(QPointF(*edge.coordinates[0]))
 
-    def _update_scene_boundary(self):
+    def _update_scene_boundary(self) -> None:
         scene = self.scene()
         # Leave some margins
-        rect = scene.itemsBoundingRect()  # type: QRectF
+        rect: QRectF = scene.itemsBoundingRect()
         scene.setSceneRect(QRectF(rect.x() - 200, rect.y() - 200, rect.width() + 400, rect.height() + 400))
 
-    def show_instruction(self, insn_addr, insn_pos=None, centering=False, use_block_pos=False, use_animation=True):
-        block = self._insaddr_to_block.get(insn_addr, None)  # type: QGraphBlock
+    def show_instruction(
+        self, insn_addr, insn_pos=None, centering: bool = False, use_block_pos: bool = False, use_animation: bool = True
+    ) -> None:
+        block: QGraphBlock = self._insaddr_to_block.get(insn_addr, None)
         if block is not None:
             if use_block_pos:
                 x, y = block.mapToScene(block.x(), block.y())
@@ -316,8 +366,11 @@ class QDisassemblyGraph(QDisassemblyBaseControl, QZoomableDraggableGraphicsView)
             else:
                 self.centerOn(x, y)
 
-    def update_label(self, addr, is_renaming=False):
-        block = self._insaddr_to_block.get(addr, None)  # type: QGraphBlock
+    def instruction_widget_rect(self, insn_addr: int):
+        return self._instruction_widget_rect(insn_addr, self)
+
+    def update_label(self, addr: int, is_renaming: bool = False) -> None:
+        block: QGraphBlock = self._insaddr_to_block.get(addr, None)
         if block is not None:
             if is_renaming:
                 # we just need to refresh the current block
@@ -334,6 +387,10 @@ class QDisassemblyGraph(QDisassemblyBaseControl, QZoomableDraggableGraphicsView)
     #
 
     def _initial_position(self):
+        if self.entry_block is None:
+            # the displayed function has no blocks (e.g., a function created at a call site during CFG recovery
+            # whose body has not been traced yet); center on whatever the scene contains
+            return self.scene().itemsBoundingRect().center()
         entry_block_rect = self.entry_block.mapRectToScene(self.entry_block.boundingRect())
         viewport_height = self.viewport().rect().height()
         min_rect = self.scene().itemsBoundingRect()

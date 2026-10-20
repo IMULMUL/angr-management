@@ -1,36 +1,25 @@
-from PySide2.QtWidgets import QToolBar, QAction
-from PySide2.QtCore import QSize
+from __future__ import annotations
 
+from PySide6.QtCore import QSize
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import QToolBar
 
-class ToolbarAction:
-    def __init__(self, icon, name, tooltip, triggered, checkable=False, shortcut=None):
-        self.icon = icon
-        self.name = name
-        self.tooltip = tooltip
-        self.triggered = triggered
-        self.checkable = checkable
-        self.shortcut = shortcut
-
-    def __hash__(self):
-        return hash((ToolbarAction, self.name))
-
-    def __eq__(self, other):
-        return isinstance(other, ToolbarAction) and self.name == other.name
-
-
-class ToolbarSplitter(ToolbarAction):
-    def __init__(self):
-        super(ToolbarSplitter, self).__init__(None, None, None, None)
+from .toolbar_action import ToolbarAction, ToolbarSplitter
 
 
 class Toolbar:
-    def __init__(self, window, name):
+    def __init__(self, window, name: str) -> None:
         self.window = window
         self.name = name
 
         self.actions = []
-        self._cached = None  # type: QToolBar
-        self._cached_actions = { }
+        self._cached: QToolBar | None = None
+        self._cached_actions = {}
+
+    def shutdown(self) -> None:
+        """
+        Prepare for deletion.
+        """
 
     def qtoolbar(self):
         if self._cached is not None:
@@ -73,7 +62,7 @@ class Toolbar:
         else:
             raise TypeError("Bad toolbar action", action)
 
-    def add(self, element):
+    def add(self, element) -> None:
         if self._cached is not None:
             act = self._translate_element(self._cached, element)
             if act is not None:
@@ -85,8 +74,8 @@ class Toolbar:
         # REQUIRES object identity
         try:
             act = self._cached_actions[element]
-        except KeyError:
-            raise ValueError("Element %s not found" % element)
+        except KeyError as ex:
+            raise ValueError(f"Element {element} not found") from ex
 
         self.actions.remove(element)
         if self._cached is not None:

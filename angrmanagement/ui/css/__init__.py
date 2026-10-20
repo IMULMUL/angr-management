@@ -1,124 +1,68 @@
+from __future__ import annotations
+
+import logging
+import os
 import sys
+from string import Template
 
-from PySide2.QtWidgets import QApplication
-from PySide2.QtGui import QPalette
+from PySide6.QtGui import QPalette
+from PySide6.QtWidgets import QApplication
 
-from ..widgets.qccode_highlighter import reset_formats
-from ...data.object_container import ObjectContainer
-from ...config import Conf
-from ...logic import GlobalInfo
+from angrmanagement.config import Conf
+from angrmanagement.consts import RES_LOCATION, THEME_LOCATION
+from angrmanagement.data.object_container import ObjectContainer
+from angrmanagement.logic import GlobalInfo
+from angrmanagement.ui.icons import update_icon_colors
+from angrmanagement.ui.widgets.qccode_highlighter import reset_formats
 
+log = logging.getLogger(__name__)
 
-def repr_color(color):
-    r,g,b,a = color.getRgb()
-    return f'rgba({r},{g},{b},{a})'
 
 #
 # FIXME: Need to propagate CSS updates to more objects.
 #
 
-class CSS:
 
-    global_css = ObjectContainer('', 'Global CSS')
+class CSS:
+    """
+    Main stylesheet re-load logic.
+    """
+
+    global_css = ObjectContainer("", "Global CSS")
 
     @staticmethod
-    def rebuild():
-        CSS.global_css.am_obj = """
-QLabel[class=insn] {
-    font: 10pt courier new;
-    color: #000080;
-}
+    def rebuild() -> None:
+        base_css_path = os.path.join(THEME_LOCATION, "base.css")
+        try:
+            with open(base_css_path, encoding="utf-8") as f:
+                css = f.read()
+        except Exception:  # pylint: disable=broad-except
+            log.warning("Failed to load base theme at %s", base_css_path)
+            css = ""
 
-QLabel[class=reg_viewer_label] {
-    font: 10pt courier new;
-    background-color: #ffffff;
-}
+        theme_path = os.path.join(THEME_LOCATION, Conf.base_theme_name)
+        css_path = os.path.join(theme_path, "theme.css")
+        if os.path.exists(css_path):
+            try:
+                with open(css_path, encoding="utf-8") as f:
+                    css += "\n" + f.read()
+            except Exception:  # pylint: disable=broad-except
+                log.warning("Failed to load theme CSS at %s", css_path)
 
-QLabel[class=ast_viewer_size] {
-    font: 10pt courier new;
-}
-
-QLabel[class=ast_viewer_ast_concrete] {
-    font: 10pt courier new;
-    color: blue;
-}
-
-QLabel[class=ast_viewer_ast_symbolic] {
-    font: 10pt courier new;
-    color: green;
-}
-
-QLabel[class=memory_viewer_address] {
-    font: 10pt courier new;
-}
-
-QLabel[class=status_valid] {
-    color: green;
-}
-
-QLabel[class=status_invalid] {
-    color: red;
-}
-
-QFrame[class=insn_selected] {
-    font: 10pt courier new;
-    color: #000000;
-    background-color: #efbfba;
-}
-
-QBlock {
-    border: 1px solid black;
-}
-
-QBlockLabel {
-    color: #0000ff;
-}
-
-QLabel[class=insn_addr] {
-    font: 10pt courier new;
-    color: black;
-}
-
-QLabel[class=insn_string] {
-    font: 10pt courier new;
-    color: gray;
-    font-weight: bold;
-}
-
-QDockWidget::title {
-    """ + f"background: {repr_color(Conf.palette_mid)};" + """
-    border: 1px solid gray;
-    padding: 0px 0px 0px 5px;
-    margin: 0px 0px 2px 0px;
-}
-
-QPlainTextEdit, QTextEdit {
-    """ + f"background-color: {repr_color(Conf.palette_base)};" + """
-}
-
-QTableView {
-    """ + f"background-color: {repr_color(Conf.palette_base)};" + """
-}
-"""
+        theme_resources_path = RES_LOCATION
+        if sys.platform == "win32":
+            theme_resources_path = theme_resources_path.replace("\\", "/")
+            theme_path = theme_path.replace("\\", "/")
+        CSS.global_css.am_obj = Template(css).safe_substitute(resources=theme_resources_path, theme=theme_path)
         CSS.global_css.am_event()
 
 
-def refresh_theme():
+def refresh_theme() -> None:
     app = QApplication.instance()
 
     # determine the default application style according to the OS
-    if sys.platform == "win32":
-        if Conf.theme_name == "Light":
-            app_style = None
-        else:
-            app_style = "Fusion"
-    elif sys.platform == "darwin":
-        if Conf.theme_name == "Light":
-            app_style = None
-        else:
-            app_style = "Fusion"
-    elif sys.platform == "linux":
-        app_style = "Fusion"
+    if sys.platform == "win32" and Conf.base_theme_name == "Light":
+        app_style = "windowsvista"
     else:
         app_style = "Fusion"
 
@@ -126,28 +70,30 @@ def refresh_theme():
         app.setStyle(app_style)
 
     palette = QPalette()
-    palette.setColor(QPalette.Window,          Conf.palette_window)
-    palette.setColor(QPalette.WindowText,      Conf.palette_windowtext)
-    palette.setColor(QPalette.Base,            Conf.palette_base)
-    palette.setColor(QPalette.AlternateBase,   Conf.palette_alternatebase)
-    palette.setColor(QPalette.ToolTipBase,     Conf.palette_tooltipbase)
-    palette.setColor(QPalette.ToolTipText,     Conf.palette_tooltiptext)
-    palette.setColor(QPalette.Text,            Conf.palette_text)
-    palette.setColor(QPalette.Button,          Conf.palette_button)
-    palette.setColor(QPalette.ButtonText,      Conf.palette_buttontext)
-    palette.setColor(QPalette.BrightText,      Conf.palette_brighttext)
-    palette.setColor(QPalette.Highlight,       Conf.palette_highlight)
-    palette.setColor(QPalette.HighlightedText, Conf.palette_highlightedtext)
-    palette.setColor(QPalette.Light,           Conf.palette_light)
-    palette.setColor(QPalette.Midlight,        Conf.palette_midlight)
-    palette.setColor(QPalette.Dark,            Conf.palette_dark)
-    palette.setColor(QPalette.Mid,             Conf.palette_mid)
-    palette.setColor(QPalette.Shadow,          Conf.palette_shadow)
-    palette.setColor(QPalette.Link,            Conf.palette_link)
-    palette.setColor(QPalette.LinkVisited,     Conf.palette_linkvisited)
-    palette.setColor(QPalette.Disabled, QPalette.Text,       Conf.palette_disabled_text)
-    palette.setColor(QPalette.Disabled, QPalette.ButtonText, Conf.palette_disabled_buttontext)
-    palette.setColor(QPalette.Disabled, QPalette.WindowText, Conf.palette_disabled_windowtext)
+    palette.setColor(QPalette.ColorRole.Window, Conf.palette_window)
+    palette.setColor(QPalette.ColorRole.WindowText, Conf.palette_windowtext)
+    palette.setColor(QPalette.ColorRole.Base, Conf.palette_base)
+    palette.setColor(QPalette.ColorRole.AlternateBase, Conf.palette_alternatebase)
+    palette.setColor(QPalette.ColorRole.ToolTipBase, Conf.palette_tooltipbase)
+    palette.setColor(QPalette.ColorRole.ToolTipText, Conf.palette_tooltiptext)
+    palette.setColor(QPalette.ColorRole.PlaceholderText, Conf.palette_placeholdertext)
+    palette.setColor(QPalette.ColorRole.Text, Conf.palette_text)
+    palette.setColor(QPalette.ColorRole.Button, Conf.palette_button)
+    palette.setColor(QPalette.ColorRole.ButtonText, Conf.palette_buttontext)
+    palette.setColor(QPalette.ColorRole.BrightText, Conf.palette_brighttext)
+    palette.setColor(QPalette.ColorRole.Highlight, Conf.palette_highlight)
+    palette.setColor(QPalette.ColorRole.HighlightedText, Conf.palette_highlightedtext)
+    palette.setColor(QPalette.ColorRole.Light, Conf.palette_light)
+    palette.setColor(QPalette.ColorRole.Midlight, Conf.palette_midlight)
+    palette.setColor(QPalette.ColorRole.Dark, Conf.palette_dark)
+    palette.setColor(QPalette.ColorRole.Mid, Conf.palette_mid)
+    palette.setColor(QPalette.ColorRole.Shadow, Conf.palette_shadow)
+    palette.setColor(QPalette.ColorRole.Link, Conf.palette_link)
+    palette.setColor(QPalette.ColorRole.LinkVisited, Conf.palette_linkvisited)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, Conf.palette_disabled_text)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, Conf.palette_disabled_buttontext)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, Conf.palette_disabled_windowtext)
+    update_icon_colors(palette)
     app.setPalette(palette)
     CSS.rebuild()
     app.setStyleSheet(CSS.global_css.am_obj)
@@ -155,9 +101,5 @@ def refresh_theme():
     reset_formats()
 
     if GlobalInfo.main_window is not None:
-        for codeview in GlobalInfo.main_window.workspace.view_manager.views_by_category['pseudocode']:
-            codeview.codegen.am_event(already_regenerated=True)
-
-            if codeview._textedit is not None:
-                for panel in codeview._textedit.panels:
-                    panel.setPalette(palette)
+        for codeview in GlobalInfo.main_window.workspace.view_manager.views_by_category["pseudocode"]:
+            codeview.set_codeedit_palette(palette)

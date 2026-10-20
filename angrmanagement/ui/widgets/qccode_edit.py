@@ -1,42 +1,65 @@
+from __future__ import annotations
+
+import logging
 from typing import TYPE_CHECKING
 
-from PySide2.QtCore import Qt, QEvent
-from PySide2.QtGui import QTextCharFormat
-from PySide2.QtWidgets import QMenu, QAction, QInputDialog, QLineEdit, QApplication
-
-from pyqodeng.core import api
-from pyqodeng.core import modes
-from pyqodeng.core import panels
-
-from ailment.statement import Store, Assignment
-from ailment.expression import Load, Convert
+from angr.ailment.expression import BinaryOp, Load, Op, UnaryOp
+from angr.ailment.statement import Assignment, Store
+from angr.analyses.decompiler.edits import set_function_prototype as core_set_function_prototype
+from angr.analyses.decompiler.known_patterns.generator import PatternGenerationError, PatternGenerator
+from angr.analyses.decompiler.optimization_passes.expr_op_swapper import OpDescriptor
+from angr.analyses.decompiler.structured_codegen import (
+    BinaryOpNode,
+    ConstantNode,
+    ExpressionNode,
+    FunctionCallNode,
+    FunctionNode,
+    IndexedVariableNode,
+    StructFieldNode,
+    UnaryOpNode,
+    VariableFieldNode,
+    VariableNode,
+)
 from angr.sim_type import SimType
-from angr.sim_variable import SimVariable, SimTemporaryVariable
-from angr.analyses.decompiler.structured_codegen.c import CBinaryOp, CVariable, CFunctionCall, CFunction, \
-    CStructField, CIndexedVariable, CVariableField
+from angr.sim_variable import SimMemoryVariable, SimStackVariable, SimTemporaryVariable, SimVariable
+from pyqodeng.core import api, modes, panels
+from pyqodeng.core.api.syntax_highlighter import COLOR_SCHEME_KEYS
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit, QMenu
 
-from ..documents.qcodedocument import QCodeDocument
-from ..dialogs.rename_node import RenameNode
-from ..dialogs.retype_node import RetypeNode
-from ..widgets.qccode_highlighter import QCCodeHighlighter
-from ..menus.menu import Menu
+from angrmanagement.mcp.edit_hooks import WorkspaceEditHooks
+from angrmanagement.ui.dialogs.rename_node import RenameNode
+from angrmanagement.ui.dialogs.retype_node import RetypeNode
+from angrmanagement.ui.dialogs.xref import XRefDialog
+from angrmanagement.ui.documents.qcodedocument import QCodeDocument
+from angrmanagement.ui.menus.menu import Menu
+from angrmanagement.ui.views.pattern_view import PatternView
+from angrmanagement.ui.widgets.qccode_highlighter import FORMATS, QCCodeHighlighter
+from angrmanagement.ui.widgets.qinline_comment_editor import QInlineCommentEditor
+from angrmanagement.ui.widgets.qnode_tip import QNodeTip
 
 if TYPE_CHECKING:
-    from PySide2.QtGui import QTextDocument
-    from ..views.code_view import CodeView
+    from angr.sim_type import SimTypeFunction
+    from PySide6.QtGui import QTextDocument
+
+    from angrmanagement.ui.views.code_view import CodeView
+
+
+_l = logging.getLogger(__name__)
 
 
 class ColorSchemeIDA(api.ColorScheme):
     """
     An IDA-like color scheme.
     """
-    def __init__(self):
-        super().__init__('default')
 
-        # override existing formats
-        function_format = QTextCharFormat()
-        function_format.setForeground(self._get_brush("0000ff"))
-        self.formats['function'] = function_format
+    def __init__(self) -> None:
+        super().__init__("default")
+        for k, v in FORMATS.items():
+            if k in COLOR_SCHEME_KEYS:
+                self.formats[COLOR_SCHEME_KEYS[k]] = v
+                self.formats[k] = v
 
 
 class QCCodeEdit(api.CodeEdit):
@@ -44,28 +67,37 @@ class QCCodeEdit(api.CodeEdit):
     A subclass of pyqodeng's CodeEdit, specialized to handle the kinds of textual interaction expected of the pseudocode
     view. You will typically interact with this class as code_view.textedit.
     """
-    def __init__(self, code_view):
+
+    def __init__(self, code_view) -> None:
+        self._palette_updating = False
+        self.line_number_panel: panels.LineNumberPanel | None = None
+        self.folding_panel: panels.FoldingPanel | None = None
+        self.code_highlighter: QCCodeHighlighter | None = None
+        self.color_scheme: api.ColorScheme | None = None
+
         super().__init__(create_default_actions=True)
-
-        self._code_view: 'CodeView' = code_view
-
-        self.panels.append(panels.LineNumberPanel())
-        self.panels.append(panels.FoldingPanel())
+        self._code_view: CodeView = code_view
+        self.create_panels()
 
         self.modes.append(modes.SymbolMatcherMode())
 
         self.setTabChangesFocus(False)
         self.setReadOnly(True)
 
-        self.constant_actions = [ ]
-        self.operator_actions = [ ]
-        self.variable_actions = [ ]
-        self.selected_actions = [ ]
-        self.call_actions = [ ]
-        self.default_actions = [ ]
+        self._node_tip = QNodeTip(self)
+
+        self.constant_actions = []
+        self.operator_actions = []
+        self.variable_actions = []
+        self.call_actions = []
+        self.default_actions = []
         self.function_name_actions = []
         self.action_rename_node = None
+        self.action_xref = None
         self._selected_node = None
+        self._inline_comment_editor: QInlineCommentEditor | None = None
+
+        self.mouse_moved.connect(self._on_hover_mouse_moved)
 
         self._initialize_context_menus()
 
@@ -78,8 +110,26 @@ class QCCodeEdit(api.CodeEdit):
         self.remove_action(self.action_swap_line_up)
         self.remove_action(self.action_swap_line_down)
 
+    def create_panels(self):
+        self.line_number_panel = panels.LineNumberPanel()
+        self.folding_panel = panels.FoldingPanel()
+        self.panels.append(self.line_number_panel)
+        self.panels.append(self.folding_panel)
+        self.line_number_panel.setVisible(True)
+        self.folding_panel.setVisible(True)
+
+    def remove_panels(self):
+        if self.line_number_panel is not None:
+            self.line_number_panel.setVisible(False)
+            self.panels.remove(self.line_number_panel.name)
+            self.line_number_panel = None
+        if self.folding_panel is not None:
+            self.folding_panel.setVisible(False)
+            self.panels.remove(self.folding_panel.name)
+            self.folding_panel = None
+
     def node_under_cursor(self):
-        doc: 'QTextDocument' = self.document()
+        doc: QTextDocument = self.document()
         if not isinstance(doc, QCodeDocument):
             # this is not the qcodedocument that the decompiler generates. this means the pseudocode view is empty
             return None
@@ -105,28 +155,32 @@ class QCCodeEdit(api.CodeEdit):
 
         mnu = QMenu()
         self._selected_node = None
-        if isinstance(under_cursor, CBinaryOp) \
-                and "vex_stmt_idx" in under_cursor.tags \
-                and "vex_block_addr" in under_cursor.tags:
+        if isinstance(under_cursor, ConstantNode):
+            self._selected_node = under_cursor
+            mnu.addActions(self.constant_actions)
+        if isinstance(under_cursor, BinaryOpNode | UnaryOpNode):
             # operator in selection
             self._selected_node = under_cursor
             mnu.addActions(self.operator_actions)
-        if isinstance(under_cursor, CFunctionCall) \
-                and "vex_block_addr" in under_cursor.tags \
-                and "ins_addr" in under_cursor.tags:
+        if (
+            isinstance(under_cursor, FunctionCallNode)
+            and "vex_block_addr" in under_cursor.tags
+            and "ins_addr" in under_cursor.tags
+        ):
             # function call in selection
             self._selected_node = under_cursor
             mnu.addActions(self.call_actions)
-        if isinstance(under_cursor, (CVariable, CIndexedVariable, CVariableField, CStructField)):
+        if isinstance(under_cursor, VariableNode | IndexedVariableNode | VariableFieldNode | StructFieldNode):
             # variable in selection
             self._selected_node = under_cursor
             mnu.addActions(self.variable_actions)
-        if isinstance(under_cursor, CFunction):
+        if isinstance(under_cursor, FunctionNode):
             # decompiled function name in selection
             self._selected_node = under_cursor
             mnu.addActions(self.function_name_actions)
             for entry in self.workspace.plugins.build_context_menu_functions(
-                    [self.workspace.instance.kb.functions[under_cursor.name]]):
+                [self.instance.kb.functions[under_cursor.name]]
+            ):
                 Menu.translate_element(mnu, entry)
         else:
             mnu.addActions(self.default_actions)
@@ -134,11 +188,22 @@ class QCCodeEdit(api.CodeEdit):
         for entry in self.workspace.plugins.build_context_menu_node(under_cursor):
             Menu.translate_element(mnu, entry)
 
+        for action in self.llm_actions:
+            mnu.addAction(action)
+
+        if self._code_view is not None and self._code_view.has_pattern_highlight:
+            mnu.addSeparator()
+            mnu.addAction(self.action_clear_pattern_highlights)
+
         return mnu
 
     @property
     def workspace(self):
         return self._code_view.workspace if self._code_view is not None else None
+
+    @property
+    def instance(self):
+        return self._code_view.instance if self._code_view is not None else None
 
     def event(self, event):
         """
@@ -156,6 +221,24 @@ class QCCodeEdit(api.CodeEdit):
 
         return super().event(event)
 
+    def get_closest_insaddr(self, node, expr=None) -> int | None:
+        addr = (getattr(node, "tags", None) or {}).get("ins_addr", None)
+        if addr is None:
+            if expr:
+                addr = self.get_src_to_inst()
+            else:
+                pos = self.textCursor().position()
+                # find until the next newline
+                while (
+                    self.document().characterAt(pos) not in ("\n", "\u2029") and pos < self.document().characterCount()
+                ):  # qt WHAT are you doing
+                    pos += 1
+                prior_pos = pos - 1  # use the location before the newline, otherwise we get the node of the next line
+                node = self.document().get_stmt_node_at_position(prior_pos)
+                addr = (getattr(node, "tags", None) or {}).get("ins_addr", None)
+
+        return addr
+
     def get_src_to_inst(self) -> int:
         """
         Uses the current cursor position, which is in a code view, and gets the
@@ -166,7 +249,7 @@ class QCCodeEdit(api.CodeEdit):
         """
 
         # get the Qt document
-        doc: 'QCodeDocument' = self.document()
+        doc: QCodeDocument = self.document()
 
         # get the current position of the cursor
         cursor = self.textCursor()
@@ -175,9 +258,13 @@ class QCCodeEdit(api.CodeEdit):
         # get the node at the associated cursor position
         current_node = doc.get_stmt_node_at_position(pos)
 
-        if current_node is not None and hasattr(current_node, 'tags') and \
-                current_node.tags is not None and 'ins_addr' in current_node.tags:
-            asm_ins_addr = current_node.tags['ins_addr']
+        if (
+            current_node is not None
+            and hasattr(current_node, "tags")
+            and current_node.tags is not None
+            and "ins_addr" in current_node.tags
+        ):
+            asm_ins_addr = current_node.tags["ins_addr"]
 
         else:
             # the top of the function decompiled
@@ -186,123 +273,310 @@ class QCCodeEdit(api.CodeEdit):
         return asm_ins_addr
 
     def keyPressEvent(self, event):
+        self._dismiss_nodetip()
         key = event.key()
-        node = self.node_under_cursor()
+        modifiers = event.modifiers()
+        xkey = key
+        if isinstance(xkey, int):
+            xkey = Qt.Key(xkey)
+        if modifiers & Qt.ShiftModifier:
+            xkey |= Qt.Key.Key_Shift
+        if modifiers & Qt.ControlModifier:
+            xkey |= Qt.Key.Key_Control
+        if modifiers & Qt.AltModifier:
+            xkey |= Qt.Key.Key_Alt
+        if modifiers & Qt.MetaModifier:
+            xkey |= Qt.Key.Key_Meta
+        sequence = QKeySequence(xkey)
+        mnu = self.get_context_menu()
+        for item in mnu.actions():
+            if item.shortcut().matches(sequence) == QKeySequence.SequenceMatch.ExactMatch:
+                item.activate(QAction.ActionEvent.Trigger)
+                return True
 
-        if key == Qt.Key_N:
-            if node is not None:
-                self.rename_node(node=node)
+        if key in (Qt.Key_Slash, Qt.Key_Question, Qt.Key_Semicolon):
+            self.comment(
+                expr=event.modifiers() & Qt.KeyboardModifier.ShiftModifier == Qt.KeyboardModifier.ShiftModifier
+            )
             return True
-        if key == Qt.Key_Y:
-            # setting the type
-            if isinstance(node, (CVariable, )):
-                # find existing type
-                self.retype_node(node=node, node_type=node.variable_type)
+        if key == Qt.Key_Colon:
+            # Shift+; -- the multi-line-capable dialog
+            self.comment(inline=False)
             return True
-        if key in (Qt.Key_Slash, Qt.Key_Question):
-            self.comment(expr=event.modifiers() & Qt.ShiftModifier == Qt.ShiftModifier)
-            return True
-        if key == Qt.Key_Minus and QApplication.keyboardModifiers() & Qt.CTRL != 0:
+        if key == Qt.Key_Minus and QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier != 0:
             self.zoomOut()
-        if key == Qt.Key_Equal and QApplication.keyboardModifiers() & Qt.CTRL != 0:
+        if key == Qt.Key_Equal and QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier != 0:
             self.zoomIn()
 
         if self._code_view.keyPressEvent(event):
             return True
 
         saved_mode = self.textInteractionFlags()
-        if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down,
-                   Qt.Key_PageDown, Qt.Key_PageUp, Qt.Key_Home, Qt.Key_End):
-            self.setTextInteractionFlags(saved_mode | Qt.TextEditable)
+        if key in (
+            Qt.Key.Key_Left,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+            Qt.Key.Key_PageDown,
+            Qt.Key.Key_PageUp,
+            Qt.Key.Key_Home,
+            Qt.Key.Key_End,
+        ):
+            self.setTextInteractionFlags(saved_mode | Qt.TextInteractionFlag.TextEditable)
         result = super().keyPressEvent(event)
         self.setTextInteractionFlags(saved_mode)
         return result
 
-    def paintEvent(self, e):
+    def paintEvent(self, e) -> None:
         saved_mode = self.textInteractionFlags()
-        self.setTextInteractionFlags(saved_mode | Qt.TextEditable)
+        self.setTextInteractionFlags(saved_mode | Qt.TextInteractionFlag.TextEditable)
         super().paintEvent(e)
         self.setTextInteractionFlags(saved_mode)
 
-    def setDocument(self, document):
+    def setDocument(self, document) -> None:
         super().setDocument(document)
 
-        self.modes.append(QCCodeHighlighter(self.document(), color_scheme=ColorSchemeIDA()))
+        self.color_scheme = ColorSchemeIDA()
+        self.code_highlighter = QCCodeHighlighter(
+            self.document(), color_scheme=self.color_scheme, flavor=self._code_view.flavor
+        )
+        self.modes.append(self.code_highlighter)
         self.syntax_highlighter.fold_detector = api.CharBasedFoldDetector()
+
+    def setPalette(self, palette, **kwargs) -> None:
+        super().setPalette(palette, **kwargs)
+        if self._palette_updating:
+            return
+        self._palette_updating = True
+        # re-create panels to apply the new palette
+        self.remove_panels()
+        self.create_panels()
+
+        if hasattr(self, "_node_tip") and self._node_tip is not None:
+            self._node_tip.refresh_palette()
+
+        # re-generate color scheme because FORMATS has changed
+        if self.color_scheme is not None:
+            self.color_scheme = ColorSchemeIDA()
+        if self.code_highlighter is not None:
+            self.code_highlighter.refresh_editor(self.color_scheme)
+            self.rehighlight()
+        self._palette_updating = False
+
+    def _on_hover_mouse_moved(self, event) -> None:
+        doc = self.document()
+        if not isinstance(doc, QCodeDocument):
+            self._dismiss_nodetip()
+            return
+
+        pos = self.cursorForPosition(event.pos()).position()
+        node = doc.get_node_at_position(pos)
+
+        if node is None:
+            self._dismiss_nodetip()
+            return
+
+        if self._node_tip.current_node is node:
+            return
+
+        self._node_tip.show_tip(node, self.mapToGlobal(event.pos()))
+
+    def _dismiss_nodetip(self) -> None:
+        self._node_tip.hide_tip()
+
+    def leaveEvent(self, event) -> None:
+        self._dismiss_nodetip()
+        super().leaveEvent(event)
+
+    def focusOutEvent(self, event) -> None:
+        self._dismiss_nodetip()
+        super().focusOutEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        self._dismiss_nodetip()
+        super().wheelEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        self._dismiss_nodetip()
+        super().mousePressEvent(event)
 
     #
     # Actions
     #
-
-    def rename_node(self, *args, node=None):  # pylint: disable=unused-argument
+    # pylint: disable=unused-argument
+    def rename_node(self, *args, node=None) -> None:  # pylint: disable=unused-argument
         n = node if node is not None else self._selected_node
-        if not isinstance(n, (CVariable, CFunction, CFunctionCall, CStructField, SimType)):
+        if not isinstance(n, VariableNode | FunctionNode | FunctionCallNode | StructFieldNode | SimType):
             return
-        if isinstance(n, CVariable) and isinstance(n.variable, SimTemporaryVariable):
+        if isinstance(n, VariableNode) and isinstance(n.variable, SimTemporaryVariable):
             # unsupported right now..
             return
-        dialog = RenameNode(code_view=self._code_view, node=n)
+        dialog = RenameNode(code_view=self._code_view, node=n, func=self._code_view.function)
         dialog.exec_()
 
-    def retype_node(self, *args, node=None, node_type=None):  # pylint: disable=unused-argument
+    def xref_node(self, *args, node=None) -> None:  # pylint: disable=unused-argument
+        n = node if node is not None else self._selected_node
+        if not isinstance(n, VariableNode | FunctionNode | FunctionCallNode):
+            return
+
+        if isinstance(n, FunctionNode | FunctionCallNode):
+            addr = n.addr if isinstance(n, FunctionNode) else n.callee_func.addr
+            dialog = XRefDialog(
+                addr=addr,
+                xrefs_manager=self.instance.project.kb.xrefs,
+                dst_addr=addr,
+                instance=self.instance,
+                disassembly_view=self._code_view,
+                parent=self._code_view,
+            )
+        else:
+            addr = self.get_closest_insaddr(n)
+            func_addr_or_global = (
+                "global"
+                if isinstance(n.variable, SimMemoryVariable) and not isinstance(n.variable, SimStackVariable)
+                else None
+            )
+            dialog = XRefDialog(
+                addr=addr,
+                variable_manager=self._code_view.variable_manager(func_addr=func_addr_or_global),
+                variable=n.variable,
+                instance=self.instance,
+                disassembly_view=self._code_view,
+                parent=self._code_view,
+            )
+        dialog.exec_()
+
+    def _set_user_prototype(self, proto: SimTypeFunction) -> dict:
+        # mark the prototype as user-provided. the decompiler will re-derive any prototype that it inferred itself.
+        # returns the renames and manual types that the re-decompilation will drop
+        result = core_set_function_prototype(
+            self.instance.project.am_obj,
+            self._code_view.function.am_obj,
+            proto,
+            kb=self.instance.kb,
+            hooks=WorkspaceEditHooks(self._code_view.workspace),
+            invalidate_cache=False,  # CodeView.decompile(reset_cache=True) drops the cache itself
+        )
+        return result.detail.get("user_edits") or {}
+
+    def retype_node(self, *args, node=None, node_type=None) -> None:  # pylint: disable=unused-argument
         if node is None:
             node = self._selected_node
-        if not isinstance(node, (CVariable, CFunction, CFunctionCall, CStructField)):
+        if not isinstance(node, VariableNode | FunctionNode | FunctionCallNode | StructFieldNode):
             return
-        if isinstance(node, CVariable) and isinstance(node.variable, SimTemporaryVariable):
+        if isinstance(node, VariableNode) and isinstance(node.variable, SimTemporaryVariable):
             # unsupported right now..
             return
-        dialog = RetypeNode(self.workspace.instance, code_view=self._code_view, node=node,
-                            node_type=node_type, variable=node.variable)
+        if node_type is None and hasattr(node, "type"):
+            node_type = node.type
+        dialog = RetypeNode(self.instance, code_view=self._code_view, node=node, node_type=node_type)
         dialog.exec_()
 
         new_node_type = dialog.new_type
-        if new_node_type is not None:
-            if self._code_view is not None and node is not None:
+        if new_node_type is not None and self._code_view is not None and node is not None:
+            new_node_type = new_node_type.with_arch(self.instance.project.arch)
+            if isinstance(node, FunctionNode):
+                user_edits = self._set_user_prototype(new_node_type)
+                self._code_view.codegen.am_event(event="retype_function", node=node, user_edits=user_edits)
+                return
+
+            if isinstance(node, StructFieldNode):
+                node.struct_type.fields[node.field] = new_node_type
+                self._code_view.codegen.am_event(event="retype_variable", node=node)
+                return
+
+            if isinstance(node, VariableNode):
+                # Function argument
+                if node.unified_variable is not None and node.unified_variable.is_function_argument:
+                    cfunc = self._code_view.codegen.cfunc
+                    for idx, arg in enumerate(cfunc.arg_list):
+                        if arg is node:
+                            new_proto = self._code_view.function.prototype.copy()
+                            new_args = list(new_proto.args)
+                            new_args[idx] = new_node_type
+                            new_proto.args = tuple(new_args)
+                            user_edits = self._set_user_prototype(new_proto)
+                            self._code_view.codegen.am_event(event="retype_function", node=cfunc, user_edits=user_edits)
+                            return
+
                 # need workspace for altering callbacks of changes
-                workspace = self._code_view.workspace
-                variable_kb = self._code_view.codegen._variable_kb
-                # specify the type
-                new_node_type = new_node_type.with_arch(workspace.instance.project.arch)
-                variable_kb.variables[self._code_view.function.addr].variables_with_manual_types.add(node.variable)
-                variable_kb.variables[self._code_view.function.addr].set_variable_type(node.variable, new_node_type)
+                dec_variables = self._code_view.codegen.kb.dec_variables
+
+                # Local variable
+                if (
+                    node.unified_variable is not None
+                    and node.unified_variable in self._code_view.codegen.cfunc.get_unified_local_vars()
+                ):
+                    dec_variables[self._code_view.codegen.cfunc.addr].set_variable_type(
+                        node.variable,
+                        new_node_type,
+                        all_unified=True,
+                        mark_manual=True,
+                    )
+                # Global variable
+                else:
+                    dec_variables["global"].set_variable_type(
+                        node.variable,
+                        new_node_type,
+                        all_unified=False,
+                        mark_manual=True,
+                    )
 
                 self._code_view.codegen.am_event(event="retype_variable", node=node, variable=node.variable)
 
-    def comment(self, expr=False, node=None):
-        addr = (getattr(node, 'tags', None) or {}).get('ins_addr', None)
-        if addr is None:
-            if expr:
-                addr = self.get_src_to_inst()
-            else:
-                pos = self.textCursor().position()
-                while self.document().characterAt(pos) not in ('\n', '\u2029') and \
-                        pos < self.document().characterCount():  # qt WHAT are you doing
-                    pos += 1
-                node = self.document().get_stmt_node_at_position(pos)
-                addr = (getattr(node, 'tags', None) or {}).get('ins_addr', None)
-
+    def comment(self, expr: bool = False, node=None, inline: bool = True) -> None:
+        addr = self.get_closest_insaddr(node, expr=expr)
         if addr is None:
             return
 
+        if expr:
+            self._comment_expr(addr)
+            return
+
+        # statement comments go into kb.comments so they survive re-decompilation and show up in
+        # the disassembly too; the edit layer mirrors them into codegen.stmt_comments
+        kb = self._code_view.instance.kb
+        text = "" if kb is None else kb.comments.get(addr, "")
+        if inline and "\n" not in text:
+            self.begin_inline_comment(addr, text)
+            return
+
+        text, ok = QInputDialog.getText(
+            self._code_view, "Statement Comment", "", QLineEdit.EchoMode.Normal, text.replace("\n", " ")
+        )
+        if ok:
+            self._commit_inline_comment(addr, text)
+
+    def begin_inline_comment(self, addr: int, text: str) -> QInlineCommentEditor:
+        """
+        Edit the comment for ``addr`` in a one-line editor floating at the text cursor.
+        """
+        if self._inline_comment_editor is not None:
+            self._inline_comment_editor.cancel()
+        editor = QInlineCommentEditor(self, addr, text, self._commit_inline_comment)
+        rect = self.cursorRect()
+        editor.show_at(rect.bottomLeft(), self.viewport().width() // 2)
+        self._inline_comment_editor = editor
+        return editor
+
+    def _commit_inline_comment(self, addr: int, text: str) -> None:
+        self._inline_comment_editor = None
+        self.workspace.set_comment(addr, text)
+
+    def _comment_expr(self, addr: int) -> None:
         try:
-            cdict = self._code_view.codegen.expr_comments if expr else self._code_view.codegen.stmt_comments
+            cdict = self._code_view.codegen.expr_comments
         except AttributeError:
             return
         text = cdict.get(addr, "")
 
-        text, ok = QInputDialog.getText(
-            self._code_view,
-            "Expression Comment" if expr else "Statement Comment",
-            "",
-            QLineEdit.Normal,
-            text)
+        text, ok = QInputDialog.getText(self._code_view, "Expression Comment", "", QLineEdit.EchoMode.Normal, text)
 
         if ok:
             exists = addr in cdict
             if text:
                 # callback
-                self.workspace.plugins.handle_comment_changed(addr, "", text, not exists, True)
+                self.workspace.plugins.handle_comment_changed(addr, cdict.get(addr, ""), text, not exists, True)
                 cdict[addr] = text
             else:
                 if exists:
@@ -312,9 +586,9 @@ class QCCodeEdit(api.CodeEdit):
 
             self._code_view.codegen.am_event()
 
-    def toggle_struct(self):
+    def toggle_struct(self) -> None:
         node = self._selected_node
-        if not isinstance(node, CVariable):
+        if not isinstance(node, VariableNode):
             return
         if isinstance(node.variable, SimVariable):
             ident = node.variable.ident
@@ -325,17 +599,165 @@ class QCCodeEdit(api.CodeEdit):
             # decompile again
             self._code_view.decompile()
 
-    def expr2armasm(self):
+    def collapse_expr(self) -> None:
+        if hasattr(self._selected_node, "collapsed"):
+            self._selected_node.collapsed = True
+            self._code_view.codegen.am_event()
 
+    def expand_expr(self) -> None:
+        if hasattr(self._selected_node, "collapsed"):
+            self._selected_node.collapsed = False
+            self._code_view.codegen.am_event()
+
+    def hex_constant(self) -> None:
+        if hasattr(self._selected_node, "fmt_hex"):
+            self._selected_node.fmt_hex ^= True
+            self._code_view.codegen.am_event()
+
+    def char_constant(self) -> None:
+        if hasattr(self._selected_node, "fmt_char"):
+            self._selected_node.fmt_char ^= True
+            self._code_view.codegen.am_event()
+
+    def neg_constant(self) -> None:
+        if hasattr(self._selected_node, "fmt_neg"):
+            self._selected_node.fmt_neg ^= True
+            self._code_view.codegen.am_event()
+
+    def float_constant(self) -> None:
+        if hasattr(self._selected_node, "fmt_float"):
+            self._selected_node.fmt_float ^= True
+            self._code_view.codegen.am_event()
+
+    def double_constant(self) -> None:
+        if hasattr(self._selected_node, "fmt_double"):
+            self._selected_node.fmt_double ^= True
+            self._code_view.codegen.am_event()
+
+    def create_pattern(self, call_name: str | None = None) -> PatternView | None:
+        """Turn the selected text into a pattern and open it in the editor view.
+
+        ``call_name`` is asked for when not given. Returns the view, or None when there
+        is no selection, no decompilation, or nothing whole inside the selection.
+        """
+        cursor = self.textCursor()
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        if start >= end:
+            _l.warning("Select the statements the pattern should cover first.")
+            return None
+        codegen = self._code_view.codegen.am_obj
+        function = self._code_view.function
+        if codegen is None or function is None:
+            return None
+        cache = self.instance.kb.decompilations.get((function.addr, "pseudocode"))
+        graph = cache.clinic.cc_graph if cache is not None and cache.clinic is not None else None
+        if graph is None:
+            _l.warning("No AIL graph is cached for this function; decompile it first.")
+            return None
+        if call_name is None:
+            call_name, ok = QInputDialog.getText(self, "Pattern", "Name of the call the pattern becomes:")
+            if not ok or not call_name.strip():
+                return None
+        try:
+            pattern = PatternGenerator(codegen, graph).generate_pattern(start, end, call_name.strip())
+        except PatternGenerationError as ex:
+            _l.warning("Cannot make a pattern out of this selection: %s", ex)
+            return None
+        view = self.workspace._get_or_create_view("pattern", PatternView, position="center")
+        view.load_pattern(pattern, origin_func=function.addr)
+        self.workspace.raise_view(view)
+        return view
+
+    def convert_to_ite_expr(self) -> None:
+        node = self._selected_node
+        if not isinstance(node, ExpressionNode):
+            return
+        ailexpr = self._code_view.codegen.cnode2ailexpr.get(node, None)
+        if ailexpr is None:
+            return
+
+        # which statement?
+        addr = self.get_closest_insaddr(node)
+        if addr is None:
+            return
+
+        cache = self.instance.kb.decompilations[(self._code_view.function.addr, "pseudocode")]
+        if cache.ite_exprs is None:
+            cache.ite_exprs = set()
+        cache.ite_exprs.add((addr, ailexpr))
+        self._code_view.decompile(regen_clinic=False)
+
+    def swap_binop_operands(self) -> None:
+        node = self._selected_node
+        if not isinstance(node, BinaryOpNode):
+            return
+        ailexpr = self._code_view.codegen.cnode2ailexpr.get(node, None)
+        if ailexpr is None:
+            return
+        if not isinstance(ailexpr, BinaryOp):
+            return
+
+        op = ailexpr.op
+        negated_op = op if op in {"CmpEQ", "CmpNE"} else BinaryOp.COMPARISON_NEGATION.get(op, None)
+        if negated_op is None:
+            return
+
+        # which statement?
+        addr = self.get_closest_insaddr(node)
+        if addr is None:
+            return
+
+        cache = self.instance.kb.decompilations[(self._code_view.function.addr, "pseudocode")]
+        if cache.binop_operators is None:
+            cache.binop_operators = {}
+        op_desc = OpDescriptor(
+            ailexpr.vex_block_addr if hasattr(ailexpr, "vex_block_addr") else None,
+            ailexpr.vex_stmt_idx if hasattr(ailexpr, "vex_stmt_idx") else None,
+            addr,
+            op,
+        )
+
+        existing_op_desc_removed = False
+        if negated_op in {"CmpEQ", "CmpNE"} or negated_op != op:
+            # remove existing descriptor if we are swapping the same binop expression twice
+            existing_op_desc = OpDescriptor(
+                ailexpr.vex_block_addr if hasattr(ailexpr, "vex_block_addr") else None,
+                ailexpr.vex_stmt_idx if hasattr(ailexpr, "vex_stmt_idx") else None,
+                addr,
+                negated_op,
+            )
+            if existing_op_desc in cache.binop_operators:
+                del cache.binop_operators[existing_op_desc]
+                existing_op_desc_removed = True
+
+        if not existing_op_desc_removed:
+            cache.binop_operators[op_desc] = negated_op
+        self._code_view.decompile(regen_clinic=False)
+
+    def expr2armasm(self) -> None:
         def _assemble(expr, expr_addr) -> str:
             return converter.assemble(expr, self._code_view.function.addr, expr_addr)
 
+        def _find_loads(expr) -> list:
+            if isinstance(expr, Load):
+                return [expr]
+            elif isinstance(expr, Op):
+                if isinstance(expr, UnaryOp):
+                    return _find_loads(expr.operand)
+                else:
+                    loads = []
+                    for operand in expr.operands:
+                        loads += _find_loads(operand)
+                    return loads
+            else:
+                return []
+
         node = self._selected_node
         # figure out where we are
-        if not isinstance(node, (CVariable, CIndexedVariable, CVariableField, CStructField)):
+        if not isinstance(node, VariableNode | IndexedVariableNode | VariableFieldNode | StructFieldNode):
             return
 
-        doc: 'QCodeDocument' = self.document()
+        doc: QCodeDocument = self.document()
         cursor = self.textCursor()
         pos = cursor.position()
         current_node = doc.get_stmt_node_at_position(pos)
@@ -348,7 +770,7 @@ class QCCodeEdit(api.CodeEdit):
             return
 
         # traverse the stored clinic graph to find the AIL block
-        cache = self.workspace.instance.kb.structured_code[(self._code_view.function.addr, "pseudocode")]
+        cache = self.instance.kb.decompilations[(self._code_view.function.addr, "pseudocode")]
         the_node = None
         for node in cache.clinic.graph.nodes():
             if node.addr <= ins_addr < node.addr + node.original_size:
@@ -360,23 +782,18 @@ class QCCodeEdit(api.CodeEdit):
 
         converter = self.workspace.plugins.get_plugin_instance_by_name("AIL2ARM32")
 
-        # I'm lazy - I'll get the first Load if available
-        lst = [ ]
+        lst = []
         for stmt in the_node.statements:
             if isinstance(stmt, Assignment):
-                if isinstance(stmt.src, Load):
-                    asm = _assemble(stmt.src, stmt.src.ins_addr)
-                    lst.append((str(stmt), str(stmt.src), asm))
-                elif isinstance(stmt.src, Convert) and isinstance(stmt.src.operand, Load):
-                    asm = _assemble(stmt.src, stmt.src.operand.ins_addr)
-                    lst.append((str(stmt), str(stmt.src), asm))
+                loads = _find_loads(stmt.src)
+                for load in loads:
+                    asm = _assemble(load, load.ins_addr)
+                    lst.append((str(stmt), str(load), asm))
             elif isinstance(stmt, Store):
-                if isinstance(stmt.data, Load):
-                    asm = _assemble(stmt.data, stmt.data.ins_addr)
-                    lst.append((str(stmt), str(stmt.data), asm))
-                elif isinstance(stmt.data, Convert) and isinstance(stmt.data.operand, Load):
-                    asm = _assemble(stmt.data, stmt.data.operand.ins_addr)
-                    lst.append((str(stmt), str(stmt.data), asm))
+                loads = _find_loads(stmt.data)
+                for load in loads:
+                    asm = _assemble(load, load.ins_addr)
+                    lst.append((str(stmt), str(load), asm))
 
         # format text
         text = f"The AIL block:\n{str(the_node)}\n\n"
@@ -387,26 +804,81 @@ class QCCodeEdit(api.CodeEdit):
 
         converter.display_output(text)
 
+    #
+    # Private methods
+    #
+
     @staticmethod
     def _separator():
         sep = QAction()
         sep.setSeparator(True)
         return sep
 
-    def _initialize_context_menus(self):
+    def _llm_refine_all(self) -> None:
+        self.workspace.llm_refine_all()
 
+    def _llm_suggest_var_names(self) -> None:
+        self.workspace.llm_suggest_variable_names()
+
+    def _llm_suggest_func_name(self) -> None:
+        self.workspace.llm_suggest_function_name()
+
+    def _llm_suggest_var_types(self) -> None:
+        self.workspace.llm_suggest_variable_types()
+
+    def _initialize_context_menus(self) -> None:
         base_actions = [
             self._separator(),
             self.action_copy,
             self.action_select_all,
         ]
 
-        self.action_rename_node = QAction('Re&name variable', self)
+        self.action_rename_node = QAction("Rename...", self)
         self.action_rename_node.triggered.connect(self.rename_node)
-        self.action_retype_node = QAction("Re&type variable", self)
+        self.action_rename_node.setShortcut(QKeySequence("N"))
+        self.action_xref = QAction("Xrefs...", self)
+        self.action_xref.triggered.connect(self.xref_node)
+        self.action_xref.setShortcut(QKeySequence("X"))
+        self.action_retype_node = QAction("Specify a new type", self)
         self.action_retype_node.triggered.connect(self.retype_node)
-        self.action_toggle_struct = QAction('Toggle &struct/array')
+        self.action_retype_node.setShortcut(QKeySequence("Y"))
+        self.action_toggle_struct = QAction("Toggle &struct/array")
         self.action_toggle_struct.triggered.connect(self.toggle_struct)
+        self.action_collapse_expr = QAction("Collapse expression", self)
+        self.action_collapse_expr.triggered.connect(self.collapse_expr)
+        self.action_expand_expr = QAction("Expand expression", self)
+        self.action_expand_expr.triggered.connect(self.expand_expr)
+        self.action_hex = QAction("Toggle hex", self)
+        self.action_hex.triggered.connect(self.hex_constant)
+        self.action_hex.setShortcut(QKeySequence("H"))
+        self.action_neg = QAction("Toggle negative", self)
+        self.action_neg.triggered.connect(self.neg_constant)
+        self.action_neg.setShortcut(QKeySequence("_"))
+        self.action_char = QAction("Toggle char", self)
+        self.action_char.triggered.connect(self.char_constant)
+        self.action_char.setShortcut(QKeySequence("R"))
+        self.action_float = QAction("Toggle float", self)
+        self.action_float.triggered.connect(self.float_constant)
+        self.action_double = QAction("Toggle double", self)
+        self.action_double.triggered.connect(self.double_constant)
+        self.action_to_ite_expr = QAction("Create a ternary expression")
+        self.action_to_ite_expr.triggered.connect(self.convert_to_ite_expr)
+        self.action_swap_binop_operands = QAction("Swap operands")
+        self.action_swap_binop_operands.triggered.connect(self.swap_binop_operands)
+        self.action_comment = QAction("Comment...", self)
+        self.action_comment.triggered.connect(lambda: self.comment())
+        self.action_comment.setShortcut(QKeySequence(";"))
+        self.action_pattern = QAction("Create pattern from selection...", self)
+        self.action_pattern.triggered.connect(lambda: self.create_pattern())
+        self.action_clear_pattern_highlights = QAction("Clear pattern highlights", self)
+        self.action_clear_pattern_highlights.triggered.connect(lambda: self._code_view.clear_pattern_highlight())
+
+        expr_actions = [
+            self.action_to_ite_expr,
+            self.action_swap_binop_operands,
+            self.action_collapse_expr,
+            self.action_expand_expr,
+        ]
 
         self.action_asmgen = QAction("Expression -> ARM THUMB assembly...")
         self.action_asmgen.triggered.connect(self.expr2armasm)
@@ -416,16 +888,43 @@ class QCCodeEdit(api.CodeEdit):
             self.action_retype_node,
             self.action_toggle_struct,
             self.action_asmgen,
+            self.action_xref,
         ]
 
-        self.function_name_actions = [
-            self.action_rename_node,
+        self.function_name_actions = [self.action_rename_node, self.action_xref, self.action_retype_node]
+
+        self.constant_actions = [
+            self.action_hex,
+            self.action_neg,
+            self.action_char,
+            self.action_float,
+            self.action_double,
         ]
 
-        self.constant_actions += base_actions
-        self.operator_actions += base_actions
-        self.variable_actions += base_actions
-        self.function_name_actions += base_actions
-        self.call_actions += base_actions
-        self.selected_actions += base_actions
-        self.default_actions += base_actions
+        self.call_actions = [self.action_rename_node, self.action_xref]
+
+        comment_actions = [self.action_comment, self.action_pattern]
+
+        self.constant_actions += comment_actions + base_actions + expr_actions
+        self.operator_actions += comment_actions + base_actions + expr_actions
+        self.variable_actions += comment_actions + base_actions + expr_actions
+        self.function_name_actions += comment_actions + base_actions
+        self.call_actions += comment_actions + base_actions + expr_actions
+        self.default_actions += comment_actions + base_actions
+
+        # LLM actions
+        self.action_llm_refine_all = QAction("AI: Refine All", self)
+        self.action_llm_refine_all.triggered.connect(self._llm_refine_all)
+        self.action_llm_suggest_var_names = QAction("AI: Suggest Variable Names", self)
+        self.action_llm_suggest_var_names.triggered.connect(self._llm_suggest_var_names)
+        self.action_llm_suggest_func_name = QAction("AI: Suggest Function Name", self)
+        self.action_llm_suggest_func_name.triggered.connect(self._llm_suggest_func_name)
+        self.action_llm_suggest_var_types = QAction("AI: Suggest Variable Types", self)
+        self.action_llm_suggest_var_types.triggered.connect(self._llm_suggest_var_types)
+        self.llm_actions = [
+            self._separator(),
+            self.action_llm_refine_all,
+            self.action_llm_suggest_var_names,
+            self.action_llm_suggest_func_name,
+            self.action_llm_suggest_var_types,
+        ]

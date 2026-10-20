@@ -1,11 +1,16 @@
-from typing import Optional, Tuple, TYPE_CHECKING
-from PySide2.QtCore import Qt
+from __future__ import annotations
+
 from enum import Enum
+from typing import TYPE_CHECKING
+
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtWidgets import QMessageBox
 
 if TYPE_CHECKING:
+    from angrmanagement.data.instance import Instance
+    from angrmanagement.ui.views import DisassemblyView
     from angrmanagement.ui.widgets.qblock import QBlock
     from angrmanagement.ui.widgets.qoperand import QOperand
-    from angrmanagement.ui.views import DisassemblyView
 
 
 class DisassemblyLevel(Enum):
@@ -19,11 +24,11 @@ class QDisassemblyBaseControl:
     The base control class of QLinearViewer and QDisassemblyGraph. Implements or declares common shorthands and methods.
     """
 
-    def __init__(self, workspace, disasm_view, base_cls):
-        self.workspace = workspace
-        self.disasm_view: 'DisassemblyView' = disasm_view
+    def __init__(self, instance: Instance, disasm_view, base_cls) -> None:
+        self.instance = instance
+        self.disasm_view: DisassemblyView = disasm_view
         self._base_cls = base_cls
-        self._insaddr_to_block = { }
+        self._insaddr_to_block = {}
         self._disassembly_level = disasm_view.disassembly_level
 
     @property
@@ -37,19 +42,48 @@ class QDisassemblyBaseControl:
 
         :return:    None
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def reload(self):
-        raise NotImplementedError()
+        raise NotImplementedError
 
-    def show_instruction(self, insn_addr, insn_pos=None, centering=False, use_block_pos=False, use_animation=False):
-        raise NotImplementedError()
+    def show_instruction(
+        self,
+        insn_addr,
+        insn_pos=None,
+        centering: bool = False,
+        use_block_pos: bool = False,
+        use_animation: bool = False,
+    ):
+        raise NotImplementedError
+
+    def instruction_widget_rect(self, insn_addr: int):  # pylint:disable=unused-argument
+        """
+        Where the instruction is currently drawn, in this control's own coordinates, or None if it
+        is not laid out. Used to anchor floating editors to an instruction.
+        """
+        return None
+
+    def _instruction_widget_rect(self, insn_addr: int, gview, mapper=None):
+        block = self._insaddr_to_block.get(insn_addr, None)
+        addr_to_insns = getattr(block, "addr_to_insns", None)
+        if addr_to_insns is None:
+            return None
+        insn = addr_to_insns.get(insn_addr, None)
+        if insn is None:
+            return None
+        top_left = gview.mapFromScene(insn.mapToScene(0, 0))
+        bottom_right = gview.mapFromScene(insn.mapToScene(insn.width, insn.height))
+        if mapper is not None:
+            top_left = mapper(top_left)
+            bottom_right = mapper(bottom_right)
+        return QRect(top_left, bottom_right)
 
     #
     # Public methods
     #
 
-    def get_selected_operand_info(self) -> Optional[Tuple['QBlock',int,'QOperand']]:
+    def get_selected_operand_info(self) -> tuple[QBlock, int, QOperand] | None:
         if not self.infodock.selected_operands:
             return None
 
@@ -62,7 +96,7 @@ class QDisassemblyBaseControl:
 
         return None
 
-    def set_disassembly_level(self, level:DisassemblyLevel):
+    def set_disassembly_level(self, level: DisassemblyLevel) -> None:
         self._disassembly_level = level
         self.reload()
 
@@ -70,15 +104,14 @@ class QDisassemblyBaseControl:
     # Event handlers
     #
 
-    def keyPressEvent(self, event):
-
+    def keyPressEvent(self, event) -> None:
         key = event.key()
 
-        if key == Qt.Key_N:
+        if key == Qt.Key.Key_N:
             # rename a label
             self.disasm_view.popup_rename_label_dialog()
             return
-        elif key == Qt.Key_X:
+        elif key == Qt.Key.Key_X:
             # XRef
             # try to get a selected operand
             r = self.get_selected_operand_info()
@@ -93,5 +126,26 @@ class QDisassemblyBaseControl:
                 lbl_addr = next(iter(self.infodock.selected_labels))
                 self.disasm_view.popup_xref_dialog(addr=lbl_addr, dst_addr=lbl_addr)
                 return
+
+            # try to get a selected variable
+            if len(self.infodock.selected_variables) == 1:
+                variable = next(iter(self.infodock.selected_variables))
+                self.disasm_view.popup_xref_dialog(addr=0, variable=variable)
+                return
+
+            if not self.infodock.selected_block_tree_node.am_none:
+                ty, node = self.infodock.selected_block_tree_node.am_obj
+                if ty == "func_name":
+                    self.disasm_view.popup_xref_dialog(addr=node, dst_addr=node)
+                    return
+
+            # message the user
+            QMessageBox.critical(
+                None,
+                "Invalid selection for XRefs",
+                "You must select an operand, a label, a variable, or a function header before requesting XRefs.",
+            )
+
+            return
 
         self._base_cls.keyPressEvent(self, event)

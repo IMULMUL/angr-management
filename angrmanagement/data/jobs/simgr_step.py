@@ -1,15 +1,24 @@
-from .job import Job
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from .job import InstanceJob
+
+if TYPE_CHECKING:
+    from angrmanagement.data.instance import Instance
+    from angrmanagement.logic.jobmanager import JobContext
 
 
-class SimgrStepJob(Job):
-    def __init__(self, simgr, callback=None, until_branch=False, step_callback=None):
-        super(SimgrStepJob, self).__init__('Simulation manager stepping')
+class SimgrStepJob(InstanceJob):
+    """A job that runs the step method of the simulation manager."""
+
+    def __init__(self, instance: Instance, simgr, until_branch: bool = False, step_callback=None) -> None:
+        super().__init__("Simulation manager stepping", instance, on_finish=self._fire_completion_event)
         self._simgr = simgr
-        self._callback = callback
         self._until_branch = until_branch
         self._step_callback = step_callback
 
-    def _run(self, inst):
+    def run(self, _: JobContext):
         if self._until_branch:
             orig_len = len(self._simgr.active)
             if orig_len > 0:
@@ -22,19 +31,11 @@ class SimgrStepJob(Job):
 
         return self._simgr
 
-    def finish(self, inst, result):
-        super(SimgrStepJob, self).finish(inst, result)
-        if self._callback is not None:
-            self._callback(result)
+    def _fire_completion_event(self, result) -> None:
+        self._simgr.am_event(src="job_done", job="step", result=result)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         if self._until_branch:
-            return "Stepping %r until branch" % self._simgr
+            return f"Stepping {self._simgr!r} until branch"
         else:
-            return "Stepping %r" % self._simgr
-
-    @classmethod
-    def create(cls, simgr, **kwargs):
-        def callback(result):
-            simgr.am_event(src='job_done', job='step', result=result)
-        return cls(simgr, callback=callback, **kwargs)
+            return f"Stepping {self._simgr!r}"

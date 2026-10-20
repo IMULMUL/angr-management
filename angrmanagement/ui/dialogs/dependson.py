@@ -1,27 +1,38 @@
-from typing import Optional
+from __future__ import annotations
 
-from PySide2.QtWidgets import QDialog, QLabel, QLineEdit, QPushButton, QGroupBox, QRadioButton, QHBoxLayout, \
-    QVBoxLayout, QCheckBox, QMessageBox, QWidget
+from typing import TYPE_CHECKING, Any
 
-from angr.knowledge_plugins import Function
-from angr.knowledge_plugins.key_definitions.constants import OP_BEFORE, OP_AFTER
+from angr.knowledge_plugins.key_definitions.constants import OP_AFTER, OP_BEFORE
+from PySide6.QtWidgets import (
+    QDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QRadioButton,
+    QVBoxLayout,
+    QWidget,
+)
 
-from ...utils.func import function_prototype_str
+from angrmanagement.utils.func import function_prototype_str
+
+if TYPE_CHECKING:
+    from angr.knowledge_plugins import Function
 
 
 class DependsOn(QDialog):
-    def __init__(self, addr: int, operand, instr=None, func: Optional[Function]=None, parent=None):
+    def __init__(self, addr: int, operand, instr=None, func: Function | None = None, parent=None) -> None:
         super().__init__(parent)
 
         self._addr = addr
-        self._operand = operand
-        self._instruction = instr
         self._function = func
 
         # output
-        self.location: Optional[int] = None
-        self.arg: Optional = None
-        self.reg: Optional = None
+        self.location: int | None = None
+        self.arg: Any | None = None
+        self.reg: Any | None = None
 
         # UI widgets
         self._instr_layout: QHBoxLayout = None
@@ -31,17 +42,14 @@ class DependsOn(QDialog):
 
         self._before_radio: QRadioButton = None
         self._after_radio: QRadioButton = None
-        self._arg_layout: QVBoxLayout = None
         self._arg_radiobox: QRadioButton = None
         self._arg_box: QLineEdit = None
-        self._reg_layout: QVBoxLayout = None
         self._reg_radiobox: QRadioButton = None
         self._reg_box: QLineEdit = None
 
         self._init_widgets()
 
-    def _init_widgets(self):
-
+    def _init_widgets(self) -> None:
         # the instruction
         instr_lbl = QLabel("Instruction")
         instr_box = QLineEdit("TODO")
@@ -147,11 +155,11 @@ class DependsOn(QDialog):
     # Events
     #
 
-    def _targetatoms_hide_all(self):
+    def _targetatoms_hide_all(self) -> None:
         self._arg_widget.setHidden(True)
         self._reg_widget.setHidden(True)
 
-    def _on_targetatoms_radiobutton_clicked(self):
+    def _on_targetatoms_radiobutton_clicked(self) -> None:
         self._targetatoms_hide_all()
         if self._arg_radiobox.isChecked():
             self._arg_widget.setHidden(False)
@@ -169,18 +177,20 @@ class DependsOn(QDialog):
                 self.arg = int(self._arg_box.text())
             except ValueError:
                 # invalid argument index
-                QMessageBox(self).critical(self,
-                            "Invalid argument index",
-                            "The given function argument index \"%s\" is unsupported. Only integers are allowed." % self._arg_box.text(),
-                            buttons=QMessageBox.Ok,
-                            )
+                QMessageBox(self).critical(
+                    self,
+                    "Invalid argument index",
+                    f'The given function argument index "{self._arg_box.text()}" is unsupported.',
+                    "Only integers are allowed.",
+                    buttons=QMessageBox.Ok,
+                )
                 return
         else:
-            raise NotImplementedError()
+            raise NotImplementedError
 
         self.close()
 
-    def _on_cancel_clicked(self):
+    def _on_cancel_clicked(self) -> None:
         self.location = None
         self.arg = None
         self.reg = None
